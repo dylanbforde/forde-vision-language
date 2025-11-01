@@ -23,75 +23,47 @@ to solve the critical issues of instability and computational cost, the model’
 
 Using Jax/Flax, the Conceptual Captions Dataset, and the Huggingface Datasets with streaming=True to avoid downloading.
 
-### Phase 1
+## Macro-Architecture (CLIP-Style Dual Encoder)
 
-This phase is the get good curriculum, the first 10k training steps (maybe), the slow brain feedback loop is off.
+The overall model is a **dual-encoder architecture** that learns a shared embedding space for images and text, inspired by CLIP. It does not generate text (i.e., it is not an image captioner). The goal is to produce image and text vectors that are mathematically close in the shared space if they are semantically related.
 
-The neurons are forced into a single, default “Generalist” state (Path 0). The model trains as a standard vanilla transformer.
-
-The goal is to allow the params to converge to a state where the gradients are stable, non-random, and carry meaningful information about the task.
-
-### Phase 2
-
-This phase begins at 10k training steps + 1, and continues for the rest of the training. It consists of the ‘fast’ loop running N times and the ‘slow’ loop running once.
-
-#### The Fast Loop
-
-- Reads the cached neuron_assignments and performs a standard forward/backward pass
-- Sensing: On each step this function calculates and logs a rich feature vector for every neuron. This is the Strengthened Sensing Mechanism. Instead of just Gini,GDP, we compute a D-dimensional vector
-    - Grad Gini (sparsity): Hoyer’s Sparsity of the neuron’s gradient column, which measures the role concentration
-    - Grad GDP (magnitude): L1 Norm of the gradient column. Measures influence/importance.
-    - Activation Gini: Hoyer’s Sparsity of the neurons activation over the batch. Measures Firing pattern (spare vs broad)
-    - Activation GDP: L1 Norm of the activation, measures overall firing rate
-    - Activation Variance: Variance of the activation, measures stability vs dynamism
-- Logging these [num_neurons, d_features] vectors are aggregated over the N steps
-
-#### The Slow loop
-
-- Cluster (GMM)
-    - This is the core of ‘emergence’, instead of hard coding if statements, we let the model discover its own functional types
-    - We fit a Gaussian Mixture Model with k components to the [num_neurons, d_features] data.
-    - M-step (learn): The GMM fitting process finds the k cluster centers (means) and shapes (covariances). These gmm params are themselves saved as a learned ‘meta-state’ in the variables.
-    - E-step (assign) The model uses the new GMM to calculate the most likely cluster (assign 0,1,2,etc) for each neuron, resulting in new_assignments vector
-- Smooth Neighborhood
-    - This encourages the formation of biologically plausible ‘continguous-areas’.
-    - The new assignments vector (ex shape 1024) is reshaped into its spatial 2d grid (32x32).
-    - A 2d convolution is applied with a simple 3x3 gaussian blur kernel. This acts as a ‘diffusion’ or ‘consensus’ step, forcing neighboring neurons to influence each others state.
-    - The result is a smoothed_assignments grid.
-- Actuate (Update)
-    - The final smoothed_assignments grid and the new gmm_params are saved back into the JAX variables pytree.
-    - The fast loop will now read and use this new functional map for the next N steps
+1.  **Two Towers**: The model consists of two separate Transformer-based encoders:
+    *   An **Image Encoder** (`VisionTransformer`) that processes images.
+    *   A **Text Encoder** (`TextTransformer`) that processes text captions.
+2.  **Shared Spine**: Both encoders are built from a stack of `FORDETransformerBlock`s. This shared, stateful architecture is the core of the experiment.
+3.  **Projection Heads**: The final `[CLS]` token output from each encoder is projected into a shared, lower-dimensional embedding space by a simple dense layer.
+4.  **Contrastive Loss**: The model is trained using a contrastive loss function. In each batch, it calculates the cosine similarity between all image and text embeddings. The loss function then works to maximize the similarity of the correct `(image, text)` pairs while minimizing the similarity of all other pairs.
 
 ## Breakdown
 
 ### 1. The FORDE-Transformer block
-    1. The ‘macro-architecture’ is a stack of these blocks. We are not replacing the Transformer, instead we are making its ‘brain’ adaptive.
-        1. If standard is self-attention → add/norm → MLP → add/norm then instead it would be
-        2. self-attention → add/norm → stateful_layer → add/norm
-        
-        The self attention layer handles communication, the stateful layer handles the adaptive processing of that communication 
-        
-    2. The stateful layer (actuator)
-        1. custom nn.Module that replaces the static MLP
-            1. input is a token vector z (from attention layer)
-            2. it reads its cached integer assignment from the variables state
-            3. it uses jnp.where to multiplex the token z to one of k processing paths
-                1. 0 (generalist): F_z = relu(z)
-                2. 1 (pooling/generalist): f_z = tanh(z)
-                3. 2 (Specialist): f_z = binary_step(z)
-            4. the custom gradient (binary step) is just a straight through estimator, the forward pass is 0/1 and the backward pass pretends the function was y=x allowing gradients to flow
-            5. to create highways for information, (skip connection), and make tihs dynamically controllable
-                1. the final output is a gated residual connection where the gate is also controlled by the neurons assignment, where specialist neurons are forced to process and the generalist neurons can be skipped, an output like f_z + (gate * z) assuming z is the projected residual.
-### 2. Baseline Model (”Forde-lite”)
-    1. An ablation model that removes the slow loop and the GMM
-    2. it uses hard coded, rule-based assignments based on instantaneous, not historical stats from the sensing step (e.g is_spec = grad_gini > 0.8)
-    3. if the full forde-gmm cannot outperform the simpler forde-lite model the extra complexity of the GMM and the slow brain is probably not justified
-### 3. Critical Logging at the end of every slow loop
-    1. The Brain Scan (’heat map’) (32x32) plot of the smoothed_assignments grid. This is the primary proof of ‘area’ formation.
-    2. The feature space (scatter plot), a 2d plot of the gini and gdp features, coloured by their new cluster assignment. This is the primary debug tool to see if the clusters are useful
-    3. The census (histogram), a bar chart of the neuron distribution, health check to see if model collapsed to outputting the same type for everything
+This is the fundamental building block for both the image and text encoders. We are not replacing the Transformer, but making its internal MLP adaptive.
 
-Use the metrics from conceptual captions
+*   **Standard Block**: `self-attention` → `add/norm` → `MLP` → `add/norm`
+*   **FORDE Block**: `self-attention` → `add/norm` → `StatefulLayer` → `add/norm`
+
+The self-attention layer handles communication, while the `StatefulLayer` handles the adaptive processing of that communication.
+
+### 2. The StatefulLayer (Actuator)
+This is a custom `nn.Module` that replaces the static MLP. Its key features are:
+
+1.  **Stateful Assignments**: It reads a cached integer `assignment` for each neuron from the model's state variables.
+2.  **Multiplexed Paths**: It uses `jnp.where` to route its input `z` to one of `k` processing paths based on the neuron's assignment:
+    *   `0` (Generalist): `F(z) = relu(z)`
+    *   `1` (Pooling/Generalist): `F(z) = tanh(z)`
+    *   `2` (Specialist): `F(z) = binary_step(z)`
+3.  **Custom Gradient**: The `binary_step` uses a straight-through estimator, allowing gradients to flow while the forward pass remains discontinuous.
+4.  **Gated Residual Connection**: The final output is `F(z) + (gate * z_projected)`. The `gate` is controlled by the neuron's assignment, dampening the residual connection for specialist neurons (`gate=0.1`) and forcing the network to rely on their processed output. Generalist neurons use a standard residual connection (`gate=1.0`).
+
+### 3. Baseline Model (”Forde-lite”)
+An ablation model that removes the slow loop and the GMM. It uses hard-coded, rule-based assignments based on instantaneous, not historical, stats from the sensing step (e.g., `is_spec = grad_gini > 0.8`). If the full FORDE-GMM model cannot outperform this simpler baseline, the extra complexity is not justified.
+
+### 4. Critical Logging
+At the end of every slow loop, we will generate:
+
+1.  **The Brain Scan**: A heatmap of the `smoothed_assignments` grid to prove the formation of specialized areas.
+2.  **The Feature Space**: A scatter plot of the Gini/GDP features, colored by cluster assignment, to debug cluster quality.
+3.  **The Census**: A histogram of the neuron distribution to monitor model health.
 
 ## Project Structure
 ```
