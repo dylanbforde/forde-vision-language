@@ -86,7 +86,7 @@ def slow_loop_step(mutable_variables, vision_config, text_config, key):
         print("Stats buffer is empty, skipping slow loop.")
         return jnp.array([]) # Return an empty array for new_assignments
 
-    aggregated_stats = jax.tree.map(lambda l: jnp.mean(l, axis=0), mutable_variables['stats_buffer'])
+    aggregated_stats = jax.tree.map(lambda l: l if l.ndim == 0 else jnp.mean(l, axis=0), mutable_variables['stats_buffer'])
 
     # Now, we need to flatten the aggregated stats into a (num_neurons, num_features) array
     # This depends on the structure of the model. For now, we assume a simple structure
