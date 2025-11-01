@@ -5,6 +5,7 @@ import torch
 from torch.utils.data import DataLoader
 from flax.training import train_state
 from transformers import AutoTokenizer
+from tqdm.auto import tqdm
 
 # Assuming the script is run from the project root
 from src.data.dataset import create_dataset, MAX_TEXT_LENGTH
@@ -120,7 +121,7 @@ def main():
     # --- Configuration ---
     learning_rate = 1e-4
     num_epochs = 10 # Number of epochs instead of steps
-    slow_loop_freq = 20 # Run slow loop every 20 steps
+    slow_loop_freq = 10 # Run slow loop every 10 steps
     batch_size = 4 
     features = 128 # Embedding dimension for transformers
     projection_dim = 64 # Dimension of the shared embedding space
@@ -164,14 +165,14 @@ def main():
     print("Starting training loop...")
     step = 0
     for epoch in range(num_epochs):
-        for batch in dataloader:
+        for batch in tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}"):
             state, mutable_variables, loss = train_step(state, mutable_variables, batch)
 
-            if step % 10 == 0:
+            if step % 5 == 0: # Increased frequency for loss printing
                 print(f"Step {step}, Epoch {epoch}, Loss: {loss}")
 
             # --- Slow Loop ---
-            if (step + 1) % slow_loop_freq == 0:
+            if (step + 1) % 10 == 0: # Increased frequency for slow loop
                 key, slow_loop_key = jax.random.split(key)
                 new_assignments = slow_loop_step(mutable_variables, vision_config, text_config, slow_loop_key)
                 
