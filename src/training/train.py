@@ -157,6 +157,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
     dataset = create_dataset(tokenizer)
     dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn, num_workers=2)
+    print(f"DataLoader num_workers: {dataloader.num_workers}")
     print("DataLoader created.")
 
     # --- Training Loop ---
