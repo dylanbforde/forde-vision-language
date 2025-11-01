@@ -52,7 +52,8 @@ def create_dataset(tokenizer):
             examples["caption"], 
             padding="max_length", 
             truncation=True, 
-            max_length=MAX_TEXT_LENGTH
+            max_length=MAX_TEXT_LENGTH,
+            return_tensors="np"
         )
         examples["input_ids"] = tokenized_captions["input_ids"]
         examples["attention_mask"] = tokenized_captions["attention_mask"]
