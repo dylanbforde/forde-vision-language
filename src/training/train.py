@@ -93,7 +93,7 @@ def slow_loop_step(mutable_variables, vision_config, text_config, key):
     # where the stats are stored in a way that can be easily concatenated.
     # This is a placeholder and will need to be updated based on the final model structure.
     # For now, we will assume the stats are in a dictionary and we can concatenate them.
-    flattened_stats = jnp.concatenate(list(jax.tree_util.tree_flatten(aggregated_stats)[0]), axis=0)
+    flattened_stats = jnp.stack(list(jax.tree_util.tree_flatten(aggregated_stats)[0]), axis=0)
 
     # 2. Cluster: Run GMM on aggregated stats
     assignments, gmm = cluster_neurons(flattened_stats, num_clusters=3, random_key=key)
