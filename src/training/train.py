@@ -74,7 +74,7 @@ def train_step(state, mutable_variables, batch):
     state = state.apply_gradients(grads=grads)
     return state, mutable_variables, loss
 
-def slow_loop_step(mutable_variables, vision_config, text_config, key):
+def slow_loop_step(mutable_variables, vision_config, text_config, projection_dim, key):
     """Performs the FORDE slow loop: sense, cluster, smooth, actuate."""
     print("--- Running Slow Loop ---")
     
@@ -86,7 +86,24 @@ def slow_loop_step(mutable_variables, vision_config, text_config, key):
         print("Stats buffer is empty, skipping slow loop.")
         return jnp.array([]) # Return an empty array for new_assignments
 
-    aggregated_stats = jax.tree.map(lambda l: jnp.atleast_1d(l) if l.ndim == 0 else jnp.atleast_1d(jnp.mean(l, axis=0)), mutable_variables['stats_buffer'])
+    def aggregate_and_resize(l):
+        # Ensure it's at least 1D
+        if l.ndim == 0:
+            aggregated_val = jnp.atleast_1d(l)
+        else:
+            aggregated_val = jnp.atleast_1d(jnp.mean(l, axis=0))
+
+        # Pad or truncate to projection_dim
+        current_dim = aggregated_val.shape[0]
+        if current_dim < projection_dim:
+            padding_needed = projection_dim - current_dim
+            return jnp.pad(aggregated_val, (0, padding_needed), 'constant')
+        elif current_dim > projection_dim:
+            return aggregated_val[:projection_dim]
+        else:
+            return aggregated_val
+
+    aggregated_stats = jax.tree.map(aggregate_and_resize, mutable_variables['stats_buffer'])
 
     # Now, we need to flatten the aggregated stats into a (num_neurons, num_features) array
     # This depends on the structure of the model. For now, we assume a simple structure
@@ -179,7 +196,7 @@ def main():
             # --- Slow Loop ---
             if (step + 1) % 10 == 0: # Increased frequency for slow loop
                 key, slow_loop_key = jax.random.split(key)
-                new_assignments = slow_loop_step(mutable_variables, vision_config, text_config, slow_loop_key)
+                new_assignments = slow_loop_step(mutable_variables, vision_config, text_config, projection_dim, slow_loop_key)
                 
                 # The actuation step needs to be performed on the actual state.
                 state = update_neuron_assignments(state, new_assignments)
