@@ -81,6 +81,11 @@ def slow_loop_step(mutable_variables, vision_config, text_config, key):
     # 1. Sense: Aggregate statistics from the buffer
     # The stats_buffer is a list of pytrees, where each leaf is a list of stats arrays
     # We need to aggregate them into a single pytree of aggregated stats.
+    all_leaves = jax.tree.leaves(mutable_variables['stats_buffer'])
+    if all(not l for l in all_leaves):
+        print("Stats buffer is empty, skipping slow loop.")
+        return jnp.array([]) # Return an empty array for new_assignments
+
     aggregated_stats = jax.tree.map(lambda l: jnp.mean(jnp.stack(l), axis=0), mutable_variables['stats_buffer'])
 
     # Now, we need to flatten the aggregated stats into a (num_neurons, num_features) array
