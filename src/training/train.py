@@ -151,13 +151,12 @@ def main():
         FORDEModel, key, learning_rate, dummy_image, dummy_text,
         vision_config, text_config, projection_dim
     )
-    print("Train state and mutable variables created.")
-    print("Mutable variables structure:", mutable_variables)
+    print(f"Train state and mutable variables created. Mutable variable keys: {mutable_variables.keys()}")
 
     # 2. Initialize Dataset and DataLoader
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
     dataset = create_dataset(tokenizer)
-    dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn, num_workers=4)
+    dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn, num_workers=2)
     print("DataLoader created.")
 
     # --- Training Loop ---
