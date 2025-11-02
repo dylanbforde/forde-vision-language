@@ -126,6 +126,10 @@ def slow_loop_step(mutable_variables, vision_config, text_config, projection_dim
     num_neurons = flattened_stats.shape[0]
     grid_size = (int(jnp.sqrt(num_neurons)), -1)
     assignment_grid = assignments_to_grid(assignments, grid_size)
+
+    # Define kernel_size and num_clusters locally for smooth_assignments
+    kernel_size = 3
+    num_clusters = 3
     
     smoothed_assignments_grid = smooth_assignments(assignment_grid, kernel_size=kernel_size, num_clusters=num_clusters)
     
