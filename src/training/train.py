@@ -30,6 +30,9 @@ def create_train_state(model_cls, key, learning_rate, dummy_image, dummy_text, v
     # Initialize the model parameters and all mutable variables (state, stats_buffer)
     variables = model.init(key, dummy_image, dummy_text)
     params = variables['params']
+
+    # Ensure parameters are float32 for gradient computation
+    params = jax.tree.map(lambda x: x.astype(jnp.float32) if jnp.issubdtype(x.dtype, jnp.integer) else x, params)
     mutable_variables = {k: v for k, v in variables.items() if k != 'params'}
 
     # Create an optimizer
