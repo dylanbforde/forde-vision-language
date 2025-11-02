@@ -8,9 +8,8 @@ updated functional map available to the fast loop for the next N training steps.
 
 import jax.numpy as jnp
 from flax.core import frozen_dict
-from flax.training import train_state
 
-def update_neuron_assignments(state: train_state.TrainState, new_assignments: jnp.ndarray) -> train_state.TrainState:
+def update_neuron_assignments(mutable_variables: dict, new_assignments: jnp.ndarray) -> dict:
     """
     Updates the neuron assignments in the model's state.
 
@@ -25,18 +24,13 @@ def update_neuron_assignments(state: train_state.TrainState, new_assignments: jn
     Returns:
         An updated Flax model state with the new neuron assignments.
     """
-    # Get a mutable copy of params
-    # Assuming state.params is a regular Python dictionary based on the error.
-    mutable_params = state.params.copy()
+    # Get a mutable copy of mutable_variables
+    # Assuming mutable_variables is a regular Python dictionary.
+    mutable_vars_dict = mutable_variables.copy()
 
-    # Update the relevant part of the parameters
-    # Assuming 'neuron_assignments' is directly under 'params'
-    # This part needs to be consistent with how 'neuron_assignments' is stored in the model.
-    if 'neuron_assignments' in mutable_params:
-        mutable_params['neuron_assignments'] = new_assignments
-    else:
-        mutable_params['neuron_assignments'] = new_assignments
+    # Update the relevant part of the mutable variables
+    # Assuming 'neuron_assignments' is directly in mutable_variables
+    mutable_vars_dict['neuron_assignments'] = new_assignments
 
-    # Create a new TrainState with the updated parameters
-    # Since state.params was a dict, we keep it a dict.
-    return state.replace(params=mutable_params)
+    # Return the updated mutable variables (as a dict)
+    return mutable_vars_dict

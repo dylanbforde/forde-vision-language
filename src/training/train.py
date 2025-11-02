@@ -135,7 +135,11 @@ def slow_loop_step(mutable_variables, vision_config, text_config, projection_dim
 
     # 4. Actuate: Update neuron assignments in the model state
     print("Actuation complete.")
-    return smoothed_assignments
+    
+    # Call update_neuron_assignments to update mutable_variables
+    mutable_variables = update_neuron_assignments(mutable_variables, smoothed_assignments)
+    
+    return mutable_variables, smoothed_assignments
 
 def collate_fn(examples):
     """Custom collate function to handle dictionary-based batches."""
@@ -202,10 +206,13 @@ def main():
             # --- Slow Loop ---
             if (step + 1) % 10 == 0: # Increased frequency for slow loop
                 key, slow_loop_key = jax.random.split(key)
-                new_assignments = slow_loop_step(mutable_variables, vision_config, text_config, projection_dim, slow_loop_key)
+                updated_mutable_variables, new_assignments = slow_loop_step(mutable_variables, vision_config, text_config, projection_dim, slow_loop_key)
                 
-                # The actuation step needs to be performed on the actual state.
-                state = update_neuron_assignments(state, new_assignments)
+                mutable_variables = updated_mutable_variables # Update mutable_variables in main scope
+
+                # The actuation step is now handled within slow_loop_step
+                # The line below is no longer needed if update_neuron_assignments is called inside slow_loop_step
+                # state = update_neuron_assignments(state, new_assignments)
                 print("Model state updated with new assignments.")
             
             step += 1
