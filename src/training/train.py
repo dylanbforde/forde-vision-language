@@ -35,6 +35,9 @@ def create_train_state(model_cls, key, learning_rate, dummy_image, dummy_text, v
     params = jax.tree.map(lambda x: x.astype(jnp.float32) if jnp.issubdtype(x.dtype, jnp.integer) else x, params)
     mutable_variables = {k: v for k, v in variables.items() if k != 'params'}
 
+    # Ensure mutable_variables are also float32 for gradient computation compatibility
+    mutable_variables = jax.tree.map(lambda x: x.astype(jnp.float32) if jnp.issubdtype(x.dtype, jnp.integer) else x, mutable_variables)
+
     # Create an optimizer
     tx = optax.adam(learning_rate)
 
