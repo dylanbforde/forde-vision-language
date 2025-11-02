@@ -80,7 +80,7 @@ def train_step(state, mutable_variables, batch):
     state = state.apply_gradients(grads=grads)
     return state, mutable_variables, loss
 
-def slow_loop_step(mutable_variables, vision_config, text_config, projection_dim, key, epoch):
+def slow_loop_step(mutable_variables, vision_config, text_config, projection_dim, key, epoch, step):
     """Performs the FORDE slow loop: sense, cluster, smooth, actuate."""
     print("--- Running Slow Loop ---")
     
@@ -216,7 +216,7 @@ def main():
             # --- Slow Loop ---
             if (step + 1) % 10 == 0: # Increased frequency for slow loop
                 key, slow_loop_key = jax.random.split(key)
-                updated_mutable_variables, new_assignments = slow_loop_step(mutable_variables, vision_config, text_config, projection_dim, slow_loop_key, epoch)
+                updated_mutable_variables, new_assignments = slow_loop_step(mutable_variables, vision_config, text_config, projection_dim, slow_loop_key, epoch, step)
                 
                 mutable_variables = updated_mutable_variables # Update mutable_variables in main scope
 
