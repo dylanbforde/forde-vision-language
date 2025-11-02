@@ -160,7 +160,7 @@ def main():
     learning_rate = 1e-4
     num_epochs = 10 # Number of epochs instead of steps
     slow_loop_freq = 10 # Run slow loop every 10 steps
-    batch_size = 4 
+    batch_size = 32 
     features = 128 # Embedding dimension for transformers
     projection_dim = 64 # Dimension of the shared embedding space
 
