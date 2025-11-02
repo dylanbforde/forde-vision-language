@@ -25,9 +25,9 @@ def update_neuron_assignments(state: train_state.TrainState, new_assignments: jn
     Returns:
         An updated Flax model state with the new neuron assignments.
     """
-    # Unfreeze the parameters to allow modification
-    # state.params is a FrozenDict, so we unfreeze it.
-    mutable_params = state.params.unfreeze()
+    # Get a mutable copy of params
+    # Assuming state.params is a regular Python dictionary based on the error.
+    mutable_params = state.params.copy()
 
     # Update the relevant part of the parameters
     # Assuming 'neuron_assignments' is directly under 'params'
@@ -35,13 +35,8 @@ def update_neuron_assignments(state: train_state.TrainState, new_assignments: jn
     if 'neuron_assignments' in mutable_params:
         mutable_params['neuron_assignments'] = new_assignments
     else:
-        # If 'neuron_assignments' is not directly in params, it might be nested.
-        # For now, let's assume it's directly in params.
-        # If it's not there, we add it.
         mutable_params['neuron_assignments'] = new_assignments
 
-    # Re-freeze the parameters
-    new_params = frozen_dict.freeze(mutable_params)
-
     # Create a new TrainState with the updated parameters
-    return state.replace(params=new_params)
+    # Since state.params was a dict, we keep it a dict.
+    return state.replace(params=mutable_params)
