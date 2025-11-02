@@ -214,7 +214,7 @@ def main():
                 print(f"Step {step}, Epoch {epoch}, Loss: {loss}")
 
             # --- Slow Loop ---
-            if (step + 1) % 10 == 0: # Increased frequency for slow loop
+            if (step + 1) % slow_loop_freq == 0: # Run slow loop every slow_loop_freq steps
                 key, slow_loop_key = jax.random.split(key)
                 updated_mutable_variables, new_assignments = slow_loop_step(mutable_variables, vision_config, text_config, projection_dim, slow_loop_key, epoch, step)
                 
