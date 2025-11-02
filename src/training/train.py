@@ -80,7 +80,7 @@ def train_step(state, mutable_variables, batch):
     state = state.apply_gradients(grads=grads)
     return state, mutable_variables, loss
 
-def slow_loop_step(mutable_variables, vision_config, text_config, projection_dim, key):
+def slow_loop_step(mutable_variables, vision_config, text_config, projection_dim, key, epoch):
     """Performs the FORDE slow loop: sense, cluster, smooth, actuate."""
     print("--- Running Slow Loop ---")
     
@@ -127,8 +127,14 @@ def slow_loop_step(mutable_variables, vision_config, text_config, projection_dim
     grid_size = (int(jnp.sqrt(num_neurons)), -1)
     assignment_grid = assignments_to_grid(assignments, grid_size)
     
-    smoothed_assignments_grid = smooth_assignments(assignment_grid, kernel_size=3, num_clusters=3)
+    smoothed_assignments_grid = smooth_assignments(assignment_grid, kernel_size=kernel_size, num_clusters=num_clusters)
     
+    # --- Diagnostics ---
+    from src.utils.logging import plot_brain_scan, plot_feature_space
+    plot_brain_scan(smoothed_assignments_grid, step, epoch)
+    plot_feature_space(flattened_stats, assignments, step, epoch)
+    # --- End Diagnostics ---
+
     # Reshape back to 1D
     smoothed_assignments = smoothed_assignments_grid.flatten()
     print("Smoothing complete.")
@@ -206,7 +212,7 @@ def main():
             # --- Slow Loop ---
             if (step + 1) % 10 == 0: # Increased frequency for slow loop
                 key, slow_loop_key = jax.random.split(key)
-                updated_mutable_variables, new_assignments = slow_loop_step(mutable_variables, vision_config, text_config, projection_dim, slow_loop_key)
+                updated_mutable_variables, new_assignments = slow_loop_step(mutable_variables, vision_config, text_config, projection_dim, slow_loop_key, epoch)
                 
                 mutable_variables = updated_mutable_variables # Update mutable_variables in main scope
 
