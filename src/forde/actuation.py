@@ -28,9 +28,14 @@ def update_neuron_assignments(mutable_variables: dict, new_assignments: jnp.ndar
     # Assuming mutable_variables is a regular Python dictionary.
     mutable_vars_dict = mutable_variables.copy()
 
-    # Update the relevant part of the mutable variables
-    # Assuming 'neuron_assignments' is directly in mutable_variables
-    mutable_vars_dict['neuron_assignments'] = new_assignments
+    # Ensure 'state' collection exists and is a dictionary
+    if 'state' not in mutable_vars_dict:
+        mutable_vars_dict['state'] = {}
+    elif not isinstance(mutable_vars_dict['state'], dict):
+        # This should not happen if model.init creates proper collections
+        raise TypeError("mutable_variables['state'] is not a dictionary collection.")
 
-    # Return the updated mutable variables (as a dict)
+    # Update neuron_assignments within the 'state' collection
+    mutable_vars_dict['state']['neuron_assignments'] = new_assignments
+
     return mutable_vars_dict
