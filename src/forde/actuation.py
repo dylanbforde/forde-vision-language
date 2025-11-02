@@ -8,8 +8,9 @@ updated functional map available to the fast loop for the next N training steps.
 
 import jax.numpy as jnp
 from flax.core import frozen_dict
+from flax.training import train_state
 
-def update_neuron_assignments(state: frozen_dict.FrozenDict, new_assignments: jnp.ndarray) -> frozen_dict.FrozenDict:
+def update_neuron_assignments(state: train_state.TrainState, new_assignments: jnp.ndarray) -> train_state.TrainState:
     """
     Updates the neuron assignments in the model's state.
 
@@ -24,27 +25,23 @@ def update_neuron_assignments(state: frozen_dict.FrozenDict, new_assignments: jn
     Returns:
         An updated Flax model state with the new neuron assignments.
     """
-    # Unfreeze the state to allow modification
-    state_dict = state.unfreeze()
+    # Unfreeze the parameters to allow modification
+    # state.params is a FrozenDict, so we unfreeze it.
+    mutable_params = state.params.unfreeze()
 
-    # NOTE: The exact path to the assignments will depend on the final model structure.
-    # We assume the assignments are stored in a way that can be accessed and updated.
-    # This is a placeholder for the actual path.
-    # For example, it could be: state_dict['params']['StatefulLayer_0']['neuron_assignments']
-    # We will need to adjust this based on the final implementation in train.py
-
-    # For now, let's assume a simple structure where assignments are directly in the state
-    # This will likely need to be updated to traverse the nested state dict.
-    # A more robust solution will be implemented in train.py where the state structure is known.
-    if 'neuron_assignments' in state_dict.get('params', {}):
-        state_dict['params']['neuron_assignments'] = new_assignments
+    # Update the relevant part of the parameters
+    # Assuming 'neuron_assignments' is directly under 'params'
+    # This part needs to be consistent with how 'neuron_assignments' is stored in the model.
+    if 'neuron_assignments' in mutable_params:
+        mutable_params['neuron_assignments'] = new_assignments
     else:
-        # This is a fallback, the actual implementation will be more specific
-        # and we will need to update this file once we have the full model structure
-        # For now, we will create it if it does not exist
-        if 'params' not in state_dict:
-            state_dict['params'] = {}
-        state_dict['params']['neuron_assignments'] = new_assignments
+        # If 'neuron_assignments' is not directly in params, it might be nested.
+        # For now, let's assume it's directly in params.
+        # If it's not there, we add it.
+        mutable_params['neuron_assignments'] = new_assignments
 
-    # Re-freeze the state
-    return frozen_dict.freeze(state_dict)
+    # Re-freeze the parameters
+    new_params = frozen_dict.freeze(mutable_params)
+
+    # Create a new TrainState with the updated parameters
+    return state.replace(params=new_params)
