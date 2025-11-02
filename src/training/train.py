@@ -75,7 +75,7 @@ def train_step(state, mutable_variables, batch):
 
     # Use has_aux=True to get updated_mutable_variables from loss_fn
     # argnums=0 means only params are differentiated
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True, argnums=0)
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True, argnums=0, allow_int=True)
     (loss, updated_mutable_variables), grads = grad_fn(state.params, mutable_variables)
     state = state.apply_gradients(grads=grads)
     return state, mutable_variables, loss
