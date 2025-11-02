@@ -51,10 +51,34 @@ def smooth_assignments(
     
     # Apply convolution to each cluster's one-hot map
     # The result is a grid where each cell contains the density of each cluster in its neighborhood
-    smoothed_one_hot = jnp.stack(
-        [convolve2d(one_hot_grid[:, :, i], kernel, mode='same') for i in range(num_clusters)],
+    # Calculate padding needed to ensure grid dimensions are > kernel_size
+    original_h, original_w, _ = one_hot_grid.shape
+    
+    pad_h = max(0, kernel_size + 1 - original_h)
+    pad_w = max(0, kernel_size + 1 - original_w)
+
+    # Apply padding to one_hot_grid
+    # Pad symmetrically
+    padding_config = (
+        (pad_h // 2, pad_h - pad_h // 2),
+        (pad_w // 2, pad_w - pad_w // 2),
+        (0, 0) # No padding for num_clusters dimension
+    )
+    padded_one_hot_grid = jnp.pad(one_hot_grid, padding_config, 'constant')
+
+    # Convolve on padded grid
+    smoothed_padded_one_hot_grid = jnp.stack(
+        [convolve2d(padded_one_hot_grid[:, :, i], kernel, mode='same') for i in range(num_clusters)],
         axis=-1
     )
+
+    # Unpad the result to original one_hot_grid size
+    unpadded_smoothed_one_hot_grid = smoothed_padded_one_hot_grid[
+        padding_config[0][0] : padding_config[0][0] + original_h,
+        padding_config[1][0] : padding_config[1][0] + original_w,
+        :
+    ]
+    smoothed_one_hot = unpadded_smoothed_one_hot_grid
     
     # Find the cluster with the highest density in each neighborhood
     smoothed_assignments = jnp.argmax(smoothed_one_hot, axis=-1)
