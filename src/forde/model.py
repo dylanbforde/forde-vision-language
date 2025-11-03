@@ -44,15 +44,32 @@ class StatefulLayer(nn.Module):
         
         # Aggregate stats in a mutable variable collection
         # The shape of current_stats is (features, D), where D=5
-        stats_buffer = self.variable(
+        D = current_stats.shape[1] # D = 5
+
+        # Initialize stats_buffer as a dictionary of JAX arrays, one for each neuron
+        # and a separate step_count.
+        def init_neuron_stats_buffer():
+            return {f'neuron_{i}': jnp.zeros(D, dtype=jnp.float32) for i in range(self.features)}
+
+        stats_buffer_collection = self.variable(
             'stats_buffer',
-            'stats_data',
-            lambda: {'aggregated_stats': jnp.zeros_like(current_stats), 'step_count': jnp.array(0, dtype=jnp.int32)}
+            'data',
+            lambda: {
+                'neuron_stats': init_neuron_stats_buffer(), # This is now a dict of 128 (D,) arrays
+                'step_count': jnp.array(0, dtype=jnp.int32)
+            }
         )
-        # Update aggregated_stats and increment step_count
-        stats_buffer.value = {
-            'aggregated_stats': stats_buffer.value['aggregated_stats'] + current_stats,
-            'step_count': stats_buffer.value['step_count'] + 1
+        
+        # Update neuron_stats and increment step_count
+        # We need to get a mutable copy of the neuron_stats dictionary
+        updated_neuron_stats = stats_buffer_collection.value['neuron_stats'].copy() 
+        for i in range(self.features):
+            # current_stats[i] is the (D,) feature vector for neuron i
+            updated_neuron_stats[f'neuron_{i}'] += current_stats[i] # Add per-neuron stats
+
+        stats_buffer_collection.value = {
+            'neuron_stats': updated_neuron_stats,
+            'step_count': stats_buffer_collection.value['step_count'] + 1
         }
 
         path0_out = nn.relu(x)

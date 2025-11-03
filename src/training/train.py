@@ -85,38 +85,36 @@ def slow_loop_step(mutable_variables, vision_config, text_config, projection_dim
     print("--- Running Slow Loop ---")
     
     # 1. Sense: Aggregate statistics from the buffer
-    # The stats_buffer is a list of pytrees, where each leaf is a list of stats arrays
-    # We need to aggregate them into a single pytree of aggregated stats.
-    all_leaves = jax.tree.leaves(mutable_variables['stats_buffer'])
-    if all(l.size == 0 for l in all_leaves):
-        print("Stats buffer is empty, skipping slow loop.")
-        return jnp.array([]) # Return an empty array for new_assignments
+    # The stats_buffer now contains 'neuron_stats' (a dict of (D,) arrays) and 'step_count'.
+    
+    step_count = mutable_variables['stats_buffer']['step_count']
+    if step_count == 0:
+        print("Stats buffer is empty (step_count is 0), skipping slow loop.")
+        # Return mutable_variables unchanged, and an empty array for new_assignments
+        return mutable_variables, jnp.array([])
 
-    def aggregate_and_resize(l):
-        # Ensure it's at least 1D
-        if l.ndim == 0:
-            aggregated_val = jnp.atleast_1d(l)
-        else:
-            aggregated_val = jnp.atleast_1d(jnp.mean(l, axis=0))
-
-        # Pad or truncate to projection_dim
-        current_dim = aggregated_val.shape[0]
+    # Define the aggregation and resizing function for each neuron's accumulated stats
+    def aggregate_and_resize_per_neuron(neuron_accumulated_stats):
+        # neuron_accumulated_stats is a (D,) array (sum of stats for one neuron)
+        mean_stats = neuron_accumulated_stats / step_count # Calculate mean
+        
+        # Then resize (pad/truncate) to projection_dim
+        current_dim = mean_stats.shape[0] # This will be D=5
         if current_dim < projection_dim:
             padding_needed = projection_dim - current_dim
-            return jnp.pad(aggregated_val, (0, padding_needed), 'constant')
+            return jnp.pad(mean_stats, (0, padding_needed), 'constant')
         elif current_dim > projection_dim:
-            return aggregated_val[:projection_dim]
+            return mean_stats[:projection_dim]
         else:
-            return aggregated_val
+            return mean_stats
 
-    aggregated_stats = jax.tree.map(aggregate_and_resize, mutable_variables['stats_buffer'])
+    # Apply this to the neuron_stats dictionary
+    aggregated_stats_per_neuron = jax.tree.map(aggregate_and_resize_per_neuron, mutable_variables['stats_buffer']['neuron_stats'])
 
-    # Now, we need to flatten the aggregated stats into a (num_neurons, num_features) array
-    # This depends on the structure of the model. For now, we assume a simple structure
-    # where the stats are stored in a way that can be easily concatenated.
-    # This is a placeholder and will need to be updated based on the final model structure.
-    # For now, we will assume the stats are in a dictionary and we can concatenate them.
-    flattened_stats = jnp.stack(list(jax.tree_util.tree_flatten(aggregated_stats)[0]), axis=0)
+    # flattened_stats will now be a stack of these (projection_dim,) arrays
+    # The keys of aggregated_stats_per_neuron are 'neuron_0', 'neuron_1', etc.
+    # We need to stack their values.
+    flattened_stats = jnp.stack(list(aggregated_stats_per_neuron.values()), axis=0)
 
     # 2. Cluster: Run GMM on aggregated stats
     assignments, gmm = cluster_neurons(flattened_stats, num_clusters=3, random_key=key)
