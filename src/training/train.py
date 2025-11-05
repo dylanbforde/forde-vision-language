@@ -83,6 +83,10 @@ def train_step(state, mutable_variables, batch):
 def slow_loop_step(mutable_variables, vision_config, text_config, projection_dim, key, epoch, step):
     """Performs the FORDE slow loop: sense, cluster, smooth, actuate."""
     print("--- Running Slow Loop ---")
+
+    # --- DEBUGGING ---
+    print("DEBUG: mutable_variables['stats_buffer'] keys:", mutable_variables['stats_buffer'].keys())
+    # --- END DEBUGGING ---
     
     # 1. Sense: Aggregate statistics from the buffer
     # The stats_buffer now contains 'neuron_stats' (a dict of (D,) arrays) and 'step_count'.
@@ -161,7 +165,7 @@ def main():
     # --- Configuration ---
     learning_rate = 1e-4
     num_epochs = 10 # Number of epochs instead of steps
-    slow_loop_freq = 150 # Run slow loop every 150 steps
+    slow_loop_freq = 10 # Run slow loop every 150 steps
     batch_size = 32 
     features = 128 # Embedding dimension for transformers
     projection_dim = 64 # Dimension of the shared embedding space
