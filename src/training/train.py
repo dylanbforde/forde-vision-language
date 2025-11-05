@@ -78,7 +78,7 @@ def train_step(state, mutable_variables, batch):
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True, argnums=0, allow_int=True)
     (loss, updated_mutable_variables), grads = grad_fn(state.params, mutable_variables)
     state = state.apply_gradients(grads=grads)
-    return state, mutable_variables, loss
+    return state, updated_mutable_variables, loss
 
 def slow_loop_step(mutable_variables, vision_config, text_config, projection_dim, key, epoch, step):
     """Performs the FORDE slow loop: sense, cluster, smooth, actuate."""
