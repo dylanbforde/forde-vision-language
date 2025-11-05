@@ -87,7 +87,7 @@ def slow_loop_step(mutable_variables, vision_config, text_config, projection_dim
     # 1. Sense: Aggregate statistics from the buffer
     # The stats_buffer now contains 'neuron_stats' (a dict of (D,) arrays) and 'step_count'.
     
-    step_count = mutable_variables['stats_buffer']['step_count']
+    step_count = mutable_variables['stats_buffer']['data']['step_count']
     if step_count == 0:
         print("Stats buffer is empty (step_count is 0), skipping slow loop.")
         # Return mutable_variables unchanged, and an empty array for new_assignments
@@ -109,7 +109,7 @@ def slow_loop_step(mutable_variables, vision_config, text_config, projection_dim
             return mean_stats
 
     # Apply this to the neuron_stats dictionary
-    aggregated_stats_per_neuron = jax.tree.map(aggregate_and_resize_per_neuron, mutable_variables['stats_buffer']['neuron_stats'])
+    aggregated_stats_per_neuron = jax.tree.map(aggregate_and_resize_per_neuron, mutable_variables['stats_buffer']['data']['neuron_stats'])
 
     # flattened_stats will now be a stack of these (projection_dim,) arrays
     # The keys of aggregated_stats_per_neuron are 'neuron_0', 'neuron_1', etc.
