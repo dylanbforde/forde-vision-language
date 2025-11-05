@@ -86,6 +86,8 @@ def slow_loop_step(mutable_variables, vision_config, text_config, projection_dim
 
     # --- DEBUGGING ---
     print("DEBUG: mutable_variables['stats_buffer'] keys:", mutable_variables['stats_buffer'].keys())
+    if 'VisionTransformer_0' in mutable_variables['stats_buffer']:
+        print("DEBUG: ...['VisionTransformer_0'] keys:", mutable_variables['stats_buffer']['VisionTransformer_0'].keys())
     # --- END DEBUGGING ---
     
     # 1. Sense: Aggregate statistics from the buffer
