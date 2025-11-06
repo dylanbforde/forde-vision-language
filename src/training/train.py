@@ -136,7 +136,14 @@ def slow_loop_step(mutable_variables, vision_config, text_config, projection_dim
 
     # 3. Smooth: Apply convolutional smoothing
     num_neurons = flattened_stats.shape[0]
-    grid_size = (int(jnp.sqrt(num_neurons)), -1)
+    
+    # Find factors for a rectangular grid that is as square as possible
+    r = int(jnp.sqrt(num_neurons))
+    while num_neurons % r != 0:
+        r -= 1
+    c = num_neurons // r
+    grid_size = (r, c)
+
     assignment_grid = assignments_to_grid(assignments, grid_size)
 
     kernel_size = 3
