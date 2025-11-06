@@ -1,41 +1,42 @@
 """
 Implements the "Actuation" stage of the FORDE model.
-
-This is the final step of the slow loop, where the newly computed and smoothed
-neuron assignments are written back into the model's state. This makes the
-updated functional map available to the fast loop for the next N training steps.
 """
 
 import jax.numpy as jnp
-from flax.core import frozen_dict
+from flax.core import unfreeze
 
 def update_neuron_assignments(mutable_variables: dict, new_assignments: jnp.ndarray) -> dict:
     """
-    Updates the neuron assignments in the model's state.
-
-    This function takes the current model state and a new set of assignments,
-    unfreezes the state, updates the relevant part of the state tree, and then
-    returns the new, frozen state.
-
-    Args:
-        state: The current Flax model state (a FrozenDict).
-        new_assignments: A 1D array of the new integer assignments for each neuron.
-
-    Returns:
-        An updated Flax model state with the new neuron assignments.
+    Updates the neuron assignments in the model's state by traversing the state pytree.
     """
-    # Get a mutable copy of mutable_variables
-    # Assuming mutable_variables is a regular Python dictionary.
-    mutable_vars_dict = mutable_variables.copy()
+    
+    # Flax returns FrozenDicts, we need to unfreeze to modify.
+    mutable_vars_dict = unfreeze(mutable_variables)
+    
+    assignment_offset = 0
 
-    # Ensure 'state' collection exists and is a dictionary
-    if 'state' not in mutable_vars_dict:
-        mutable_vars_dict['state'] = {}
-    elif not isinstance(mutable_vars_dict['state'], dict):
-        # This should not happen if model.init creates proper collections
-        raise TypeError("mutable_variables['state'] is not a dictionary collection.")
+    # This helper function will recursively search for the 'assignments' leaf
+    # in the state pytree and update it with a slice from the new_assignments.
+    def find_and_update(pytree_node):
+        nonlocal assignment_offset
+        if isinstance(pytree_node, dict):
+            if 'assignments' in pytree_node and isinstance(pytree_node['assignments'], jnp.ndarray):
+                num_layer_neurons = pytree_node['assignments'].shape[0]
+                
+                # Take the appropriate slice from the global new_assignments array
+                assignment_chunk = new_assignments[assignment_offset : assignment_offset + num_layer_neurons]
+                
+                # Update the assignments for this layer
+                pytree_node['assignments'] = assignment_chunk
+                
+                # Move the offset for the next layer
+                assignment_offset += num_layer_neurons
+            else:
+                # Recursively traverse the dictionary
+                for key in sorted(pytree_node.keys()): # Sort keys for deterministic order
+                    find_and_update(pytree_node[key])
 
-    # Update neuron_assignments within the 'state' collection
-    mutable_vars_dict['state']['neuron_assignments'] = new_assignments
-
+    # Start the traversal from the 'state' collection
+    find_and_update(mutable_vars_dict['state'])
+    
     return mutable_vars_dict

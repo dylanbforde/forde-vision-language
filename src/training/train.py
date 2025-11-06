@@ -84,28 +84,35 @@ def slow_loop_step(mutable_variables, vision_config, text_config, projection_dim
     """Performs the FORDE slow loop: sense, cluster, smooth, actuate."""
     print("--- Running Slow Loop ---")
 
-    # --- DEBUGGING ---
-    print("DEBUG: mutable_variables['stats_buffer'] keys:", mutable_variables['stats_buffer'].keys())
-    if 'VisionTransformer_0' in mutable_variables['stats_buffer']:
-        print("DEBUG: ...['VisionTransformer_0'] keys:", mutable_variables['stats_buffer']['VisionTransformer_0'].keys())
-    # --- END DEBUGGING ---
-    
-    # 1. Sense: Aggregate statistics from the buffer
-    # The stats_buffer now contains 'neuron_stats' (a dict of (D,) arrays) and 'step_count'.
-    
-    step_count = mutable_variables['stats_buffer']['data']['step_count']
+    # Helper to recursively find all 'data' dictionaries for stats
+    def get_all_stats_data(pytree):
+        all_data = []
+        if isinstance(pytree, dict):
+            # Using 'neuron_stats' as a unique marker for the dictionary we want
+            if 'neuron_stats' in pytree and 'step_count' in pytree:
+                all_data.append(pytree)
+            else:
+                for k in sorted(pytree.keys()): # Sort keys for deterministic order
+                    all_data.extend(get_all_stats_data(pytree[k]))
+        return all_data
+
+    # 1. Sense: Aggregate statistics from all StatefulLayers
+    all_stats_data_list = get_all_stats_data(mutable_variables['stats_buffer'])
+
+    if not all_stats_data_list:
+        print("Could not find any stats data, skipping slow loop.")
+        return mutable_variables, jnp.array([])
+
+    # All step_counts should be the same, take the first one.
+    step_count = all_stats_data_list[0]['step_count']
     if step_count == 0:
         print("Stats buffer is empty (step_count is 0), skipping slow loop.")
-        # Return mutable_variables unchanged, and an empty array for new_assignments
         return mutable_variables, jnp.array([])
 
     # Define the aggregation and resizing function for each neuron's accumulated stats
     def aggregate_and_resize_per_neuron(neuron_accumulated_stats):
-        # neuron_accumulated_stats is a (D,) array (sum of stats for one neuron)
-        mean_stats = neuron_accumulated_stats / step_count # Calculate mean
-        
-        # Then resize (pad/truncate) to projection_dim
-        current_dim = mean_stats.shape[0] # This will be D=5
+        mean_stats = neuron_accumulated_stats / step_count
+        current_dim = mean_stats.shape[0]
         if current_dim < projection_dim:
             padding_needed = projection_dim - current_dim
             return jnp.pad(mean_stats, (0, padding_needed), 'constant')
@@ -114,13 +121,14 @@ def slow_loop_step(mutable_variables, vision_config, text_config, projection_dim
         else:
             return mean_stats
 
-    # Apply this to the neuron_stats dictionary
-    aggregated_stats_per_neuron = jax.tree.map(aggregate_and_resize_per_neuron, mutable_variables['stats_buffer']['data']['neuron_stats'])
+    # Apply aggregation to all collected neuron stats
+    all_aggregated_stats = []
+    for stats_data in all_stats_data_list:
+        aggregated_dict = jax.tree.map(aggregate_and_resize_per_neuron, stats_data['neuron_stats'])
+        # .values() are the arrays for each neuron, sort keys to be safe
+        all_aggregated_stats.extend([aggregated_dict[k] for k in sorted(aggregated_dict.keys())])
 
-    # flattened_stats will now be a stack of these (projection_dim,) arrays
-    # The keys of aggregated_stats_per_neuron are 'neuron_0', 'neuron_1', etc.
-    # We need to stack their values.
-    flattened_stats = jnp.stack(list(aggregated_stats_per_neuron.values()), axis=0)
+    flattened_stats = jnp.stack(all_aggregated_stats, axis=0)
 
     # 2. Cluster: Run GMM on aggregated stats
     assignments, gmm = cluster_neurons(flattened_stats, num_clusters=3, random_key=key)
@@ -131,7 +139,6 @@ def slow_loop_step(mutable_variables, vision_config, text_config, projection_dim
     grid_size = (int(jnp.sqrt(num_neurons)), -1)
     assignment_grid = assignments_to_grid(assignments, grid_size)
 
-    # Define kernel_size and num_clusters locally for smooth_assignments
     kernel_size = 3
     num_clusters = 3
     
@@ -150,7 +157,7 @@ def slow_loop_step(mutable_variables, vision_config, text_config, projection_dim
     # 4. Actuate: Update neuron assignments in the model state
     print("Actuation complete.")
     
-    # Call update_neuron_assignments to update mutable_variables
+    # Call the new update_neuron_assignments function
     mutable_variables = update_neuron_assignments(mutable_variables, smoothed_assignments)
     
     return mutable_variables, smoothed_assignments
@@ -167,7 +174,7 @@ def main():
     # --- Configuration ---
     learning_rate = 1e-4
     num_epochs = 10 # Number of epochs instead of steps
-    slow_loop_freq = 10 # Run slow loop every 150 steps
+    slow_loop_freq = 150 # Run slow loop every 150 steps
     batch_size = 32 
     features = 128 # Embedding dimension for transformers
     projection_dim = 64 # Dimension of the shared embedding space
