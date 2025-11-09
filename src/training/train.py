@@ -4,6 +4,7 @@ import optax
 import torch
 from torch.utils.data import DataLoader
 from flax.training import train_state
+from flax.core import unfreeze
 from transformers import AutoTokenizer
 from tqdm.auto import tqdm
 
@@ -44,41 +45,66 @@ def create_train_state(model_cls, key, learning_rate, dummy_image, dummy_text, v
     # Create and return the training state and initial mutable variables
     return TrainState.create(apply_fn=model.apply, params=params, tx=tx), mutable_variables
 
-@jax.jit
+from flax.core import unfreeze
+
 def train_step(state, mutable_variables, batch):
-    """Performs a single training step with contrastive loss and updates mutable variables."""
-    def loss_fn(params, mutable_variables):
-        # Apply the model to get image and text embeddings, logit_scale, and updated mutable variables
-        (image_embed, text_embed, logit_scale), updated_mutable_variables = state.apply_fn(
-            {'params': params, **mutable_variables},
+    """
+    Performs a single training step, including gradient capture and cycling.
+    This function is not JIT-compiled itself, but orchestrates JIT-compiled sub-functions.
+    """
+    
+    # Define the loss function for both parameter and intermediate gradient calculation.
+    def loss_fn(params, mutable_vars, batch):
+        # Collections to be made mutable during the apply call.
+        mutable_collections = ['state', 'stats_buffer', 'grad_buffer', 'activations_to_grad']
+        
+        (image_embed, text_embed, logit_scale), updated_vars = state.apply_fn(
+            {'params': params, **mutable_vars},
             batch['image'],
             batch['input_ids'],
-            mutable=['state', 'stats_buffer'] # Specify which collections are mutable
+            mutable=mutable_collections
         )
 
-        # Normalize embeddings to unit length
+        # Contrastive loss calculation
         image_embed = image_embed / jnp.linalg.norm(image_embed, axis=-1, keepdims=True)
         text_embed = text_embed / jnp.linalg.norm(text_embed, axis=-1, keepdims=True)
-
-        # Compute similarity matrix (batch_size, batch_size)
         logits = jnp.matmul(image_embed, text_embed.T) * jnp.exp(logit_scale)
-
-        # Create labels for cross-entropy loss (identity matrix for matching pairs)
         labels = jnp.arange(batch['image'].shape[0])
-
-        # Calculate contrastive loss
         image_loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
         text_loss = optax.softmax_cross_entropy_with_integer_labels(logits.T, labels).mean()
-
         total_loss = (image_loss + text_loss) / 2
-        return total_loss, updated_mutable_variables
+        
+        # Return loss and the sown activations as auxiliary data for grad calculation
+        return total_loss, (updated_vars, updated_vars.get('activations_to_grad'))
 
-    # Use has_aux=True to get updated_mutable_variables from loss_fn
-    # argnums=0 means only params are differentiated
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True, argnums=0, allow_int=True)
-    (loss, updated_mutable_variables), grads = grad_fn(state.params, mutable_variables)
-    state = state.apply_gradients(grads=grads)
-    return state, updated_mutable_variables, loss
+    # JIT-compile the function that calculates gradients.
+    # argnums=0: gradients w.r.t. params
+    # argnums=1: gradients w.r.t. mutable_variables (not used here, but part of signature)
+    # We get grads w.r.t. sown activations because they are returned as aux_data.
+    grad_fn = jax.value_and_grad(loss_fn, argnums=0, has_aux=True)
+    
+    # --- Execute the training step ---
+    
+    # 1. Calculate loss, parameter gradients, and intermediate gradients
+    (loss, (updated_mutable_vars, sown_activations)), param_grads = grad_fn(state.params, mutable_variables, batch)
+    
+    # The 'param_grads' are the gradients of the loss w.r.t. the model parameters.
+    # The 'sown_activations' now implicitly contains the gradients of the loss w.r.t. itself.
+    # In this pattern, jax.grad(..., has_aux=True) on a function returning (loss, aux)
+    # gives a gradient pytree that matches the structure of aux.
+    intermediate_grads = sown_activations 
+
+    # 2. Apply parameter gradients to the optimizer state
+    state = state.apply_gradients(grads=param_grads)
+
+    # 3. Cycle the intermediate gradients for the next step.
+    # We take the intermediate gradients we just calculated and put them
+    # into the 'grad_buffer' for the next iteration to use.
+    mutable_variables = unfreeze(updated_mutable_vars)
+    if intermediate_grads:
+        mutable_variables['grad_buffer'] = intermediate_grads
+    
+    return state, mutable_variables, loss
 
 def slow_loop_step(mutable_variables, vision_config, text_config, projection_dim, key, epoch, step):
     """Performs the FORDE slow loop: sense, cluster, smooth, actuate."""

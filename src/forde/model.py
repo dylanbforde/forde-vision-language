@@ -38,16 +38,27 @@ class StatefulLayer(nn.Module):
         
         x = nn.Dense(self.features, name="dense_layer")(z)
 
-        # --- Sensing: Log Activation Statistics ---
-        # For now, gradients are zeros. We will capture real gradients later.
-        current_stats = calculate_neuron_stats(x, jnp.zeros_like(x))
-        
-        # Aggregate stats in a mutable variable collection
-        # The shape of current_stats is (features, D), where D=5
-        D = current_stats.shape[1] # D = 5
+        # --- Gradient Capture & Sensing ---
+        # 1. Sow the activation 'x' to make it available for gradient calculation
+        #    in the training step.
+        self.sow('activations_to_grad', 'pre_activation', x)
 
-        # Initialize stats_buffer as a dictionary of JAX arrays, one for each neuron
-        # and a separate step_count.
+        # 2. Read the gradients that were captured in the *previous* training step
+        #    from the 'grad_buffer' collection.
+        grad_var = self.variable(
+            'grad_buffer',
+            'pre_activation_grad',
+            lambda: jnp.zeros_like(x) # Initialize with zeros for the first step
+        )
+        prev_step_grads = grad_var.value
+
+        # 3. Use the (potentially delayed) gradients to calculate neuron stats.
+        current_stats = calculate_neuron_stats(x, prev_step_grads)
+        
+        # --- Stats Aggregation ---
+        # Aggregate stats in a mutable variable collection
+        D = current_stats.shape[1]
+
         def init_neuron_stats_buffer():
             return {f'neuron_{i}': jnp.zeros(D, dtype=jnp.float32) for i in range(self.features)}
 
@@ -55,23 +66,22 @@ class StatefulLayer(nn.Module):
             'stats_buffer',
             'data',
             lambda: {
-                'neuron_stats': init_neuron_stats_buffer(), # This is now a dict of 128 (D,) arrays
+                'neuron_stats': init_neuron_stats_buffer(),
                 'step_count': jnp.array(0, dtype=jnp.int32)
             }
         )
         
         # Update neuron_stats and increment step_count
-        # We need to get a mutable copy of the neuron_stats dictionary
         updated_neuron_stats = stats_buffer_collection.value['neuron_stats'].copy() 
         for i in range(self.features):
-            # current_stats[i] is the (D,) feature vector for neuron i
-            updated_neuron_stats[f'neuron_{i}'] += current_stats[i] # Add per-neuron stats
+            updated_neuron_stats[f'neuron_{i}'] += current_stats[i]
 
         stats_buffer_collection.value = {
             'neuron_stats': updated_neuron_stats,
             'step_count': stats_buffer_collection.value['step_count'] + 1
         }
 
+        # --- Functional Pathways ---
         path0_out = nn.relu(x)
         path1_out = nn.tanh(x)
         path2_out = binary_step(x)
