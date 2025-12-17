@@ -39,9 +39,19 @@ class StatefulLayer(nn.Module):
         x = nn.Dense(self.features, name="dense_layer")(z)
 
         # --- Gradient Capture & Sensing ---
-        # 1. Sow the activation 'x' to make it available for gradient calculation
-        #    in the training step.
-        self.sow('activations_to_grad', 'pre_activation', x)
+        # 1. Gradient Sink Pattern:
+        #    We create a variable 'sink' initialized to zeros.
+        #    We add this sink to the activation 'x'.
+        #    During the backward pass, we will differentiate w.r.t. this 'sink' variable.
+        #    The gradient of the loss w.r.t. 'sink' is exactly the gradient w.r.t. 'x'.
+        grad_sink = self.variable(
+            'grad_sinks',
+            'sink',
+            lambda: jnp.zeros_like(x)
+        )
+        # Add the sink (zeros) to x. This doesn't change the forward pass value,
+        # but connects 'grad_sink' to the computation graph.
+        x = x + grad_sink.value
 
         # 2. Read the gradients that were captured in the *previous* training step
         #    from the 'grad_buffer' collection.
@@ -53,6 +63,8 @@ class StatefulLayer(nn.Module):
         prev_step_grads = grad_var.value
 
         # 3. Use the (potentially delayed) gradients to calculate neuron stats.
+        #    Note: We use the original 'x' (before sink addition) for stats calculation
+        #    to avoid any potential circular dependency issues, though x+0 is same.
         current_stats = calculate_neuron_stats(x, prev_step_grads)
         
         # --- Stats Aggregation ---

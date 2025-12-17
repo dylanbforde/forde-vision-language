@@ -56,7 +56,9 @@ def train_step(state, mutable_variables, batch):
     # Define the loss function for both parameter and intermediate gradient calculation.
     def loss_fn(params, mutable_vars, batch):
         # Collections to be made mutable during the apply call.
-        mutable_collections = ['state', 'stats_buffer', 'grad_buffer', 'activations_to_grad']
+        # We include 'grad_sinks' here because we might want to update them (though they are just sinks)
+        # but crucially, we need to pass them in.
+        mutable_collections = ['state', 'stats_buffer', 'grad_buffer', 'grad_sinks']
         
         (image_embed, text_embed, logit_scale), updated_vars = state.apply_fn(
             {'params': params, **mutable_vars},
@@ -79,20 +81,30 @@ def train_step(state, mutable_variables, batch):
 
     # JIT-compile the function that calculates gradients.
     # argnums=0: gradients w.r.t. params
-    # argnums=1: gradients w.r.t. mutable_variables (not used here, but part of signature)
-    # We get grads w.r.t. sown activations because they are returned as aux_data.
-    grad_fn = jax.value_and_grad(loss_fn, argnums=0, has_aux=True)
+    # argnums=1: gradients w.r.t. mutable_variables (specifically 'grad_sinks' inside it)
+    # We need to restructure how we pass arguments to differentiate w.r.t. a subset of mutable_variables.
+    # To make it cleaner, we can split mutable_variables.
     
+    # Helper wrapper to handle the splitting of mutable variables
+    def loss_wrapper(params, grad_sinks, other_mutable_vars, batch):
+        # Recombine variables
+        all_mutable_vars = {**other_mutable_vars, 'grad_sinks': grad_sinks}
+        return loss_fn(params, all_mutable_vars, batch)
+
+    grad_fn = jax.value_and_grad(loss_wrapper, argnums=(0, 1), has_aux=True)
+
+    # Separate 'grad_sinks' from other mutable variables
+    grad_sinks = mutable_variables.pop('grad_sinks')
+    other_mutable_vars = mutable_variables
+
     # --- Execute the training step ---
     
-    # 1. Calculate loss, parameter gradients, and intermediate gradients
-    (loss, (updated_mutable_vars, sown_activations)), param_grads = grad_fn(state.params, mutable_variables, batch)
+    # 1. Calculate loss, parameter gradients, and sink gradients
+    (loss, (updated_mutable_vars, _)), (param_grads, sink_grads) = grad_fn(state.params, grad_sinks, other_mutable_vars, batch)
     
-    # The 'param_grads' are the gradients of the loss w.r.t. the model parameters.
-    # The 'sown_activations' now implicitly contains the gradients of the loss w.r.t. itself.
-    # In this pattern, jax.grad(..., has_aux=True) on a function returning (loss, aux)
-    # gives a gradient pytree that matches the structure of aux.
-    intermediate_grads = sown_activations 
+    # The 'sink_grads' are the gradients of the loss w.r.t. the 'grad_sinks' variables.
+    # Since 'grad_sinks' were added to activations, these are exactly dL/d(activation).
+    intermediate_grads = sink_grads 
 
     # 2. Apply parameter gradients to the optimizer state
     state = state.apply_gradients(grads=param_grads)
@@ -100,9 +112,42 @@ def train_step(state, mutable_variables, batch):
     # 3. Cycle the intermediate gradients for the next step.
     # We take the intermediate gradients we just calculated and put them
     # into the 'grad_buffer' for the next iteration to use.
+    # Note: updated_mutable_vars contains the updated state/stats_buffer/grad_buffer/grad_sinks
     mutable_variables = unfreeze(updated_mutable_vars)
+    
+    # We need to map the structure of intermediate_grads (which is {'sink': ...}) 
+    # to the structure of grad_buffer (which is {'pre_activation_grad': ...})
+    # The structure of the pytree should be identical down to the leaf names.
+    
+    def map_sink_to_buffer(sink_grad_leaf):
+        return sink_grad_leaf
+
+    # We assume the tree structure of 'grad_sinks' matches 'grad_buffer' 
+    # except for the leaf name ('sink' vs 'pre_activation_grad').
+    # However, JAX tree_map works on structure.
+    # Let's manually traverse or assume the model structure ensures alignment.
+    # A safer way is to traverse the 'grad_buffer' in mutable_variables and fill it.
+    
+    # Actually, the simplest way is to realize that 'intermediate_grads' is a dictionary 
+    # mirroring the model structure. We can just iterate and assign.
+    # But since we are using Flax variables, we can try to just swap the collection.
+    # But the collection names are different in the variable definition ('grad_sinks' vs 'grad_buffer').
+    # And the variable names are different ('sink' vs 'pre_activation_grad').
+    
+    # Let's use a recursive update that ignores the specific leaf key name
+    def update_grad_buffer(buffer_tree, sink_tree):
+        if isinstance(buffer_tree, dict) and isinstance(sink_tree, dict):
+            # If we are at the leaf container level
+            if 'pre_activation_grad' in buffer_tree and 'sink' in sink_tree:
+                buffer_tree['pre_activation_grad'] = sink_tree['sink']
+            else:
+                for k in buffer_tree.keys():
+                    if k in sink_tree:
+                        update_grad_buffer(buffer_tree[k], sink_tree[k])
+        return buffer_tree
+
     if intermediate_grads:
-        mutable_variables['grad_buffer'] = intermediate_grads
+        mutable_variables['grad_buffer'] = update_grad_buffer(mutable_variables['grad_buffer'], intermediate_grads)
     
     return state, mutable_variables, loss
 
@@ -193,6 +238,17 @@ def slow_loop_step(mutable_variables, vision_config, text_config, projection_dim
     # Call the new update_neuron_assignments function
     mutable_variables = update_neuron_assignments(mutable_variables, smoothed_assignments)
     
+    # 5. Reset Stats Buffer
+    # We need to reset the stats buffer to zeros for the next cycle.
+    # We can use the same structure as the input but filled with zeros.
+    
+    def reset_leaf(x):
+        return jnp.zeros_like(x)
+        
+    reset_stats_buffer = jax.tree.map(reset_leaf, mutable_variables['stats_buffer'])
+    mutable_variables['stats_buffer'] = reset_stats_buffer
+    print("Stats buffer reset.")
+
     return mutable_variables, smoothed_assignments
 
 def collate_fn(examples):
@@ -243,7 +299,7 @@ def main():
     # 2. Initialize Dataset and DataLoader
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
     dataset = create_dataset(tokenizer)
-    dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn, num_workers=0)
+    dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn, num_workers=4)
     print(f"DataLoader num_workers: {dataloader.num_workers}")
     print("DataLoader created.")
 

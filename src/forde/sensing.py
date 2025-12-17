@@ -25,6 +25,10 @@ def hoyer_sparsity(x):
     denominator = jnp.where(n == 1, 1.0, jnp.sqrt(n) - 1)
         
     sparsity = (jnp.sqrt(n) - (l1_norm / safe_l2_norm)) / denominator
+    
+    # If l2_norm is 0, the vector is all zeros. Sparsity is undefined/0.
+    sparsity = jnp.where(l2_norm == 0, 0.0, sparsity)
+    
     return jnp.where(n == 1, 0.0, sparsity)
 
 def calculate_neuron_stats(activations, gradients):

@@ -17,7 +17,7 @@ def process_image(image_url):
     Fetches an image from a URL, processes it, and returns it as a NumPy array.
     """
     try:
-        response = requests.get(image_url, timeout=5)
+        response = requests.get(image_url, timeout=10)
         response.raise_for_status()
         
         image = Image.open(io.BytesIO(response.content))
