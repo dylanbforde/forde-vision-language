@@ -22,7 +22,7 @@ RUN ln -s /usr/bin/python3.13 /usr/bin/python
 COPY pyproject.toml uv.lock* ./
 
 # Copy verification scripts
-COPY reproduce_grad_sink.py verify_init.py verify_hoyer.py verify_reset.py ./
+COPY tests/ ./tests/
 
 # Copy scripts directory
 COPY scripts/ ./scripts/
