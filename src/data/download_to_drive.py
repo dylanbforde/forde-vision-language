@@ -14,6 +14,11 @@ from src.data.dataset import process_image, MAX_TEXT_LENGTH
 
 def mount_drive():
     """Mounts Google Drive if running in Colab."""
+    # Check if already mounted
+    if os.path.exists('/content/drive/MyDrive'):
+        print("Google Drive already mounted.")
+        return '/content/drive/MyDrive'
+
     try:
         from google.colab import drive
         print("Mounting Google Drive...")
@@ -21,6 +26,14 @@ def mount_drive():
         return '/content/drive/MyDrive'
     except ImportError:
         print("Not running in Google Colab. Skipping Drive mount.")
+        return None
+    except Exception as e:
+        print(f"Could not mount Drive automatically: {e}")
+        print("If running in Colab terminal, please mount Drive in a notebook cell first:")
+        print("from google.colab import drive; drive.mount('/content/drive')")
+        # Fallback: assume it might be mounted or user wants to save locally in Colab
+        if os.path.exists('/content/drive'):
+             return '/content/drive/MyDrive'
         return None
 
 def process_example(example, tokenizer):
