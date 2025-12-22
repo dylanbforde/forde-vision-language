@@ -162,6 +162,8 @@ def download_and_save(output_dir, num_proc=4, max_samples=None, shard_size=5000)
         'caption': datasets.Value('string')
     })
 
+    import shutil
+
     print("Starting download and processing...")
     
     current_shard_data = []
@@ -176,39 +178,77 @@ def download_and_save(output_dir, num_proc=4, max_samples=None, shard_size=5000)
             
             if len(current_shard_data) >= shard_size:
                 # Save shard
-                shard_dir = os.path.join(output_dir, f"shard_{shard_counter}")
-                print(f"Saving shard {shard_counter} to {shard_dir}...")
-                
-                # Create dataset from memory
+                print(f"Shard {shard_counter} collected. Converting to Arrow format...")
                 shard_dataset = datasets.Dataset.from_list(current_shard_data, features=features)
-                shard_dataset.save_to_disk(shard_dir)
                 
-                print(f"Shard {shard_counter} saved.")
+                # Save to a temporary local directory first to avoid Drive I/O latency
+                temp_shard_dir = f"/content/temp_shards/shard_{shard_counter}"
+                if os.path.exists(temp_shard_dir):
+                    shutil.rmtree(temp_shard_dir)
+                
+                print(f"Saving shard {shard_counter} to temporary local storage ({temp_shard_dir})...")
+                shard_dataset.save_to_disk(temp_shard_dir)
+                
+                # Move to final destination
+                final_shard_dir = os.path.join(output_dir, f"shard_{shard_counter}")
+                print(f"Moving shard {shard_counter} to final destination: {final_shard_dir}...")
+                
+                if os.path.exists(final_shard_dir):
+                    shutil.rmtree(final_shard_dir)
+                shutil.copytree(temp_shard_dir, final_shard_dir)
+                
+                # Cleanup temp
+                shutil.rmtree(temp_shard_dir)
+                
+                print(f"Shard {shard_counter} successfully saved.")
                 shard_counter += 1
                 current_shard_data = [] # Reset buffer
                 
         # Save remaining data
         if current_shard_data:
-            shard_dir = os.path.join(output_dir, f"shard_{shard_counter}")
-            print(f"Saving final shard {shard_counter} with {len(current_shard_data)} samples...")
+            print(f"Final shard collected. Converting to Arrow format...")
             shard_dataset = datasets.Dataset.from_list(current_shard_data, features=features)
-            shard_dataset.save_to_disk(shard_dir)
+            
+            temp_shard_dir = f"/content/temp_shards/shard_{shard_counter}"
+            if os.path.exists(temp_shard_dir):
+                shutil.rmtree(temp_shard_dir)
+                
+            print(f"Saving final shard {shard_counter} to temporary local storage...")
+            shard_dataset.save_to_disk(temp_shard_dir)
+            
+            final_shard_dir = os.path.join(output_dir, f"shard_{shard_counter}")
+            print(f"Moving final shard to {final_shard_dir}...")
+            
+            if os.path.exists(final_shard_dir):
+                shutil.rmtree(final_shard_dir)
+            shutil.copytree(temp_shard_dir, final_shard_dir)
+            
+            shutil.rmtree(temp_shard_dir)
             print("Done!")
             
     except KeyboardInterrupt:
         print("\nInterrupted! Saving current progress...")
         if current_shard_data:
-             shard_dir = os.path.join(output_dir, f"shard_{shard_counter}_partial")
-             print(f"Saving partial shard to {shard_dir}...")
+             print("Converting partial shard...")
              shard_dataset = datasets.Dataset.from_list(current_shard_data, features=features)
-             shard_dataset.save_to_disk(shard_dir)
+             
+             temp_shard_dir = f"/content/temp_shards/shard_{shard_counter}_partial"
+             print(f"Saving partial shard to {temp_shard_dir}...")
+             shard_dataset.save_to_disk(temp_shard_dir)
+             
+             final_shard_dir = os.path.join(output_dir, f"shard_{shard_counter}_partial")
+             print(f"Moving partial shard to {final_shard_dir}...")
+             if os.path.exists(final_shard_dir):
+                shutil.rmtree(final_shard_dir)
+             shutil.copytree(temp_shard_dir, final_shard_dir)
+             shutil.rmtree(temp_shard_dir)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download and process dataset to Drive")
     parser.add_argument("--output_dir", type=str, default="forde_dataset", help="Directory name to save dataset")
     parser.add_argument("--num_proc", type=int, default=8, help="Number of worker threads")
     parser.add_argument("--max_samples", type=int, default=None, help="Limit number of samples for testing")
-    parser.add_argument("--shard_size", type=int, default=5000, help="Number of samples per shard")
+    parser.add_argument("--shard_size", type=int, default=1000, help="Number of samples per shard")
     
     args = parser.parse_args()
     
