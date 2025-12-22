@@ -299,7 +299,7 @@ def main():
     # 2. Initialize Dataset and DataLoader
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
     dataset = create_dataset(tokenizer)
-    dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn, num_workers=4)
+    dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn, num_workers=0)
     print(f"DataLoader num_workers: {dataloader.num_workers}")
     print("DataLoader created.")
 
