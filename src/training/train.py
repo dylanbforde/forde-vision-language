@@ -7,6 +7,8 @@ from flax.training import train_state
 from flax.core import unfreeze
 from transformers import AutoTokenizer
 from tqdm.auto import tqdm
+import argparse
+import itertools
 
 # Assuming the script is run from the project root
 from src.data.dataset import create_dataset, MAX_TEXT_LENGTH
@@ -260,11 +262,19 @@ def collate_fn(examples):
     return batch
 
 def main():
+    parser = argparse.ArgumentParser(description="Train FORDE model")
+    parser.add_argument("--num_epochs", type=int, default=10, help="Number of epochs")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
+    parser.add_argument("--num_workers", type=int, default=4, help="Number of dataloader workers")
+    parser.add_argument("--max_steps", type=int, default=None, help="Max steps per epoch")
+    parser.add_argument("--slow_loop_freq", type=int, default=150, help="Frequency of slow loop")
+    args = parser.parse_args()
+
     # --- Configuration ---
     learning_rate = 1e-4
-    num_epochs = 10 # Number of epochs instead of steps
-    slow_loop_freq = 150 # Run slow loop every 150 steps
-    batch_size = 32 
+    num_epochs = args.num_epochs
+    slow_loop_freq = args.slow_loop_freq
+    batch_size = args.batch_size
     features = 128 # Embedding dimension for transformers
     projection_dim = 64 # Dimension of the shared embedding space
 
@@ -299,7 +309,7 @@ def main():
     # 2. Initialize Dataset and DataLoader
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
     dataset = create_dataset(tokenizer)
-    dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn, num_workers=0)
+    dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn, num_workers=args.num_workers)
     print(f"DataLoader num_workers: {dataloader.num_workers}")
     print("DataLoader created.")
 
@@ -307,7 +317,11 @@ def main():
     print("Starting training loop...")
     step = 0
     for epoch in range(num_epochs):
-        for batch in tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}"):
+        epoch_iterator = dataloader
+        if args.max_steps is not None:
+            epoch_iterator = itertools.islice(dataloader, args.max_steps)
+
+        for batch in tqdm(epoch_iterator, desc=f"Epoch {epoch+1}/{num_epochs}", total=args.max_steps):
             state, mutable_variables, loss = train_step(state, mutable_variables, batch)
 
             if step % 5 == 0: # Increased frequency for loss printing
@@ -328,4 +342,8 @@ def main():
             step += 1
 
 if __name__ == "__main__":
+    try:
+        torch.multiprocessing.set_start_method('spawn')
+    except RuntimeError:
+        pass
     main()
