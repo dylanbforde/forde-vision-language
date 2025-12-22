@@ -30,16 +30,30 @@ def process_image(image_url):
         # Return None if any error occurs during fetching or processing
         return None
 
-def create_dataset(tokenizer):
+def create_dataset(tokenizer, data_dir=None):
     """
-    Creates and preprocesses the Conceptual Captions dataset using streaming.
+    Creates and preprocesses the Conceptual Captions dataset.
+    If data_dir is provided, loads from disk. Otherwise, streams from Hugging Face.
 
     Args:
         tokenizer: A tokenizer object for processing the text captions.
+        data_dir: Optional path to a saved dataset directory.
 
     Returns:
-        A streaming Hugging Face Dataset object.
+        A Hugging Face Dataset object.
     """
+    if data_dir:
+        print(f"Loading dataset from {data_dir}...")
+        try:
+            dataset = datasets.load_from_disk(data_dir)
+            # If the dataset was saved with 'image' as Array3D, it's already processed.
+            # We just need to ensure it's in the right format for the dataloader if needed.
+            # The saved dataset from our script already has 'image', 'input_ids', etc.
+            return dataset
+        except Exception as e:
+            print(f"Failed to load from {data_dir}: {e}")
+            print("Falling back to streaming mode...")
+
     dataset = datasets.load_dataset("conceptual_captions", streaming=True, split="train")
     print("Dataset loaded in streaming mode.")
 
