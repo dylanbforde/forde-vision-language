@@ -45,11 +45,26 @@ def create_dataset(tokenizer, data_dir=None):
     if data_dir:
         print(f"Loading dataset from {data_dir}...")
         try:
-            dataset = datasets.load_from_disk(data_dir)
-            # If the dataset was saved with 'image' as Array3D, it's already processed.
-            # We just need to ensure it's in the right format for the dataloader if needed.
-            # The saved dataset from our script already has 'image', 'input_ids', etc.
-            return dataset
+            # Check for shards
+            import os
+            shards = [d for d in os.listdir(data_dir) if d.startswith('shard_') and os.path.isdir(os.path.join(data_dir, d))]
+            
+            if shards:
+                print(f"Found {len(shards)} shards. Loading and concatenating...")
+                shard_datasets = []
+                # Sort by shard index
+                shards.sort(key=lambda x: int(x.split('_')[1]) if x.split('_')[1].isdigit() else 999999)
+                
+                for shard in shards:
+                    shard_path = os.path.join(data_dir, shard)
+                    shard_datasets.append(datasets.load_from_disk(shard_path))
+                
+                dataset = datasets.concatenate_datasets(shard_datasets)
+                return dataset
+            else:
+                # Try loading as a single dataset
+                dataset = datasets.load_from_disk(data_dir)
+                return dataset
         except Exception as e:
             print(f"Failed to load from {data_dir}: {e}")
             print("Falling back to streaming mode...")

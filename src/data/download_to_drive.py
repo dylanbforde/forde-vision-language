@@ -60,63 +60,101 @@ def process_example(example, tokenizer):
         'caption': example['caption']
     }
 
-def download_and_save(output_dir, num_proc=4, max_samples=None):
+def download_and_save(output_dir, num_proc=4, max_samples=None, shard_size=5000):
     """
-    Downloads, processes, and saves the dataset.
+    Downloads, processes, and saves the dataset in shards to allow resuming.
     """
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        
     print(f"Preparing to save dataset to: {output_dir}")
     
-    # Load the dataset in streaming mode first
+    # 1. Detect existing shards to resume
+    existing_shards = [d for d in os.listdir(output_dir) if d.startswith('shard_') and os.path.isdir(os.path.join(output_dir, d))]
+    
+    # Extract indices
+    shard_indices = []
+    for s in existing_shards:
+        try:
+            idx = int(s.split('_')[1])
+            shard_indices.append(idx)
+        except ValueError:
+            pass
+            
+    if shard_indices:
+        last_shard_idx = max(shard_indices)
+        next_shard_idx = last_shard_idx + 1
+        samples_processed = next_shard_idx * shard_size
+        print(f"Found {len(shard_indices)} existing shards. Resuming from shard {next_shard_idx} (skipping {samples_processed} samples).")
+    else:
+        next_shard_idx = 0
+        samples_processed = 0
+        print("No existing shards found. Starting from scratch.")
+
+    # 2. Load dataset and skip processed
     dataset = datasets.load_dataset("conceptual_captions", streaming=True, split="train")
     
+    if samples_processed > 0:
+        dataset = dataset.skip(samples_processed)
+        
     if max_samples:
-        print(f"Limiting to {max_samples} samples.")
-        dataset = dataset.take(max_samples)
+        # Adjust max_samples based on what's left
+        remaining_samples = max_samples - samples_processed
+        if remaining_samples <= 0:
+            print("Max samples reached with existing shards. Exiting.")
+            return
+        print(f"Limiting to {remaining_samples} more samples.")
+        dataset = dataset.take(remaining_samples)
     
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
     
-    # We need to iterate and process because streaming datasets don't support map with multiprocessing efficiently
-    # for network bound tasks in the same way as non-streaming for saving to disk directly via save_to_disk
-    # However, we want to save it as a HuggingFace dataset.
-    # The best approach for a massive dataset like this to be saved to disk is to use `Dataset.from_generator`
-    
-    def generator():
-        # Use a pool to process images in parallel
-        # Note: We can't easily use multiprocessing pool with the generator directly yielding 
-        # inside the pool without careful management. 
-        # A simpler approach for this script is to just map sequentially or use dataset.map if we weren't streaming.
-        # Since we are streaming, let's just use the dataset.map with batched=False but we can't easily parallelize network calls 
-        # inside map without it being slow or complex.
-        
-        # Actually, `map` on streaming datasets DOES support arbitrary python code.
-        # But to speed it up we want parallel downloads.
-        # Let's use a ThreadPoolExecutor for downloads as they are I/O bound.
-        
+    # 3. Generator that yields chunks
+    def chunked_generator():
         from concurrent.futures import ThreadPoolExecutor
-        
-        buffer = []
-        buffer_size = 100 # Process in chunks
+        import itertools
         
         iterator = iter(dataset)
         
-        with ThreadPoolExecutor(max_workers=num_proc) as executor:
-            while True:
-                chunk = list(itertools.islice(iterator, buffer_size))
-                if not chunk:
-                    break
-                
-                # Submit tasks
-                futures = [executor.submit(process_example, ex, tokenizer) for ex in chunk]
-                
-                for future in futures:
-                    result = future.result()
-                    if result is not None:
-                        yield result
+        # We need to process in batches of shard_size
+        # But we also want parallel downloads within that
+        
+        current_shard_buffer = []
+        
+        # Inner generator for parallel processing
+        def process_batch(batch_size=100):
+            with ThreadPoolExecutor(max_workers=num_proc) as executor:
+                while True:
+                    chunk = list(itertools.islice(iterator, batch_size))
+                    if not chunk:
+                        break
+                    
+                    futures = [executor.submit(process_example, ex, tokenizer) for ex in chunk]
+                    
+                    results = []
+                    for future in futures:
+                        res = future.result()
+                        if res is not None:
+                            results.append(res)
+                    yield results
+                    
+                    # If we got less than batch_size, we are done
+                    if len(chunk) < batch_size:
+                        break
 
-    import itertools
+        # Consume the parallel processor
+        for batch_results in process_batch():
+            for res in batch_results:
+                yield res
+
+    # We need to manually control the sharding loop because Dataset.from_generator 
+    # consumes the whole thing.
+    # So we will create a generator that yields exactly one shard, save it, 
+    # and then create a new generator for the next shard.
     
-    # Create a new dataset from the generator
-    # We need to define features to ensure correct types, especially for images
+    # Actually, re-creating the generator/iterator might be tricky with streaming.
+    # A better way: Iterate over the main generator and collect into a list, 
+    # then create a dataset from that list and save.
+    
     features = datasets.Features({
         'image': datasets.Array3D(shape=(224, 224, 3), dtype='float32'),
         'input_ids': datasets.Sequence(datasets.Value('int32')),
@@ -124,18 +162,53 @@ def download_and_save(output_dir, num_proc=4, max_samples=None):
         'caption': datasets.Value('string')
     })
 
-    print("Starting download and processing... this may take a while.")
-    processed_dataset = datasets.Dataset.from_generator(generator, features=features)
+    print("Starting download and processing...")
     
-    print("Saving to disk...")
-    processed_dataset.save_to_disk(output_dir)
-    print("Done!")
+    current_shard_data = []
+    shard_counter = next_shard_idx
+    
+    # Re-using the logic from before but just iterating
+    gen = chunked_generator()
+    
+    try:
+        for example in tqdm(gen, desc="Processing"):
+            current_shard_data.append(example)
+            
+            if len(current_shard_data) >= shard_size:
+                # Save shard
+                shard_dir = os.path.join(output_dir, f"shard_{shard_counter}")
+                print(f"Saving shard {shard_counter} to {shard_dir}...")
+                
+                # Create dataset from memory
+                shard_dataset = datasets.Dataset.from_list(current_shard_data, features=features)
+                shard_dataset.save_to_disk(shard_dir)
+                
+                print(f"Shard {shard_counter} saved.")
+                shard_counter += 1
+                current_shard_data = [] # Reset buffer
+                
+        # Save remaining data
+        if current_shard_data:
+            shard_dir = os.path.join(output_dir, f"shard_{shard_counter}")
+            print(f"Saving final shard {shard_counter} with {len(current_shard_data)} samples...")
+            shard_dataset = datasets.Dataset.from_list(current_shard_data, features=features)
+            shard_dataset.save_to_disk(shard_dir)
+            print("Done!")
+            
+    except KeyboardInterrupt:
+        print("\nInterrupted! Saving current progress...")
+        if current_shard_data:
+             shard_dir = os.path.join(output_dir, f"shard_{shard_counter}_partial")
+             print(f"Saving partial shard to {shard_dir}...")
+             shard_dataset = datasets.Dataset.from_list(current_shard_data, features=features)
+             shard_dataset.save_to_disk(shard_dir)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download and process dataset to Drive")
     parser.add_argument("--output_dir", type=str, default="forde_dataset", help="Directory name to save dataset")
     parser.add_argument("--num_proc", type=int, default=8, help="Number of worker threads")
     parser.add_argument("--max_samples", type=int, default=None, help="Limit number of samples for testing")
+    parser.add_argument("--shard_size", type=int, default=5000, help="Number of samples per shard")
     
     args = parser.parse_args()
     
@@ -147,4 +220,4 @@ if __name__ == "__main__":
         # If not in Colab, save locally or to specified path
         full_output_path = args.output_dir
         
-    download_and_save(full_output_path, num_proc=args.num_proc, max_samples=args.max_samples)
+    download_and_save(full_output_path, num_proc=args.num_proc, max_samples=args.max_samples, shard_size=args.shard_size)
