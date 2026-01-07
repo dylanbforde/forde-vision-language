@@ -162,7 +162,7 @@ class DecoderBlock(nn.Module):
 
         # MoE or standard FFN
         if config.use_moe:
-            moe_layer = MoELayer(
+            moe_layer = MoEStatefulLayer(
                 num_experts=config.num_experts,
                 top_k=config.top_k_experts,
                 expert_hidden_dim=config.expert_hidden_dim,

@@ -391,6 +391,17 @@ def main():
                 if "skipped" not in diagnostics:
                     print(f"  Slow loop complete. Router adjustments applied.")
 
+            # Periodic checkpointing
+            if args.checkpoint_dir and step > 0 and step % 5000 == 0:
+                print(f"Saving periodic checkpoint at step {step}...")
+                checkpoints.save_checkpoint(
+                    ckpt_dir=args.checkpoint_dir,
+                    target=state,
+                    step=step,
+                    overwrite=True,
+                    keep=3,
+                )
+
             step += 1
 
         print(f"Epoch {epoch + 1} complete. Final loss: {metrics['total_loss']:.4f}")
