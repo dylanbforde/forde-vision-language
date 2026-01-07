@@ -11,7 +11,7 @@ This training script supports:
 import jax
 import jax.numpy as jnp
 import optax
-from flax.training import train_state
+from flax.training import train_state, checkpoints
 from tqdm.auto import tqdm
 import argparse
 from dataclasses import asdict
@@ -221,7 +221,12 @@ def main():
         default=100,
         help="Steps between slow loop runs (0 to disable)",
     )
-
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        default="checkpoints",
+        help="Directory to save checkpoints",
+    )
     args = parser.parse_args()
 
     # Build config
@@ -393,6 +398,18 @@ def main():
     print(f"\n" + "=" * 60)
     print("Training complete!")
     print("=" * 60)
+
+    # Save final checkpoint
+    if args.checkpoint_dir:
+        print(f"Saving checkpoint to {args.checkpoint_dir}...")
+        checkpoints.save_checkpoint(
+            ckpt_dir=args.checkpoint_dir,
+            target=state,
+            step=args.max_steps,
+            overwrite=True,
+            keep=1,
+        )
+        print("Checkpoint saved.")
 
     if writer:
         writer.close()
