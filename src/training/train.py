@@ -23,8 +23,14 @@ try:
     from src.data.dataset import create_lm_dataset, create_dummy_dataset
 except ModuleNotFoundError:
     import sys
+    import os
 
-    sys.path.insert(0, "/home/dylan/code/python/functional-organisation")
+    # Add project root to path
+    project_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    sys.path.insert(0, project_root)
+
     from src.forde.model import FORDEDecoderLM, LLMConfig
     from src.data.dataset import create_lm_dataset, create_dummy_dataset
 

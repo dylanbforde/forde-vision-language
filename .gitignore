@@ -7,8 +7,12 @@ wheels/
 *.egg-info
 
 # Virtual environments
-# Virtual environments
 .venv
+
+# Colab
+.colab
+
+analysis.ipynb
 
 # Generated files
 *.png
