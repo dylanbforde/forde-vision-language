@@ -12,8 +12,6 @@ wheels/
 # Colab
 .colab
 
-analysis.ipynb
-
 # Generated files
 *.png
 outputs/
