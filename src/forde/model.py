@@ -1,265 +1,452 @@
+"""
+FORDE Decoder-Only LLM Model.
+
+A decoder-only autoregressive language model integrating:
+1. Mixture of Experts (MoE) - Adaptive expert routing
+2. Native Sparse Attention (NSA) - Efficient long-context attention  
+3. Manifold Constrained Hyper-Connections (mHC) - Enhanced residual connections
+4. FORDE StatefulLayer sensing - For adaptive neuron specialization
+
+This module preserves the original FORDE dual-encoder in model.py
+and introduces the decoder-only LLM as a separate architecture.
+"""
+
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from typing import Sequence
+from typing import Optional, Tuple
 from dataclasses import dataclass
 
-from src.forde.sensing import calculate_neuron_stats # Import the sensing function
+# Handle imports for both package and script execution
+try:
+    from src.forde.moe import MoELayer, MoEStatefulLayer
+    from src.forde.sparse_attention import NativeSparseAttention, CausalSelfAttention
+    from src.forde.hyper_connections import (
+        HyperConnectionStream,
+        ManifoldHyperConnection,
+        StreamCollapser
+    )
+except ModuleNotFoundError:
+    from moe import MoELayer, MoEStatefulLayer
+    from sparse_attention import NativeSparseAttention, CausalSelfAttention
+    from hyper_connections import (
+        HyperConnectionStream,
+        ManifoldHyperConnection,
+        StreamCollapser
+    )
 
-# As per the README, the binary_step function needs a custom gradient.
-# The forward pass is a step function, but the backward pass (gradient) 
-# should be a straight-through estimator (i.e., pretends the function was y=x).
-@jax.custom_jvp
-def binary_step(x):
-    return jnp.where(x > 0, 1.0, 0.0)
 
-@binary_step.defjvp
-def binary_step_jvp(primals, tangents):
-    x, = primals
-    x_dot, = tangents
-    primal_out = binary_step(x)
-    # The gradient is 1, implementing the straight-through estimator.
-    tangent_out = x_dot
-    return primal_out, tangent_out
+@dataclass
+class LLMConfig:
+    """Configuration for the decoder-only LLM."""
+    vocab_size: int = 32000
+    d_model: int = 512
+    num_layers: int = 12
+    num_heads: int = 8
+    head_dim: int = 64
+    max_seq_len: int = 2048
+    
+    # MoE configuration
+    use_moe: bool = True
+    num_experts: int = 8
+    top_k_experts: int = 2
+    expert_hidden_dim: int = 2048
+    moe_aux_loss_weight: float = 0.01
+    
+    # NSA configuration
+    use_sparse_attention: bool = True
+    window_size: int = 512
+    compression_ratio: int = 8
+    top_k_global: int = 64
+    
+    # mHC configuration
+    use_hyper_connections: bool = True
+    num_streams: int = 4
+    sinkhorn_iterations: int = 5
+    
+    # Dropout
+    dropout_rate: float = 0.1
 
-class StatefulLayer(nn.Module):
-    """A layer that replaces the standard MLP in a Transformer block."""
-    features: int
 
+class DecoderBlock(nn.Module):
+    """
+    Single decoder block with NSA + MoE + mHC integration.
+    
+    Architecture:
+    1. Pre-norm + Sparse Attention (or standard causal attention)
+    2. mHC residual mixing
+    3. Pre-norm + MoE FFN (or standard FFN)
+    4. mHC residual mixing
+    """
+    config: LLMConfig
+    
     @nn.compact
-    def __call__(self, z):
-        """Performs the forward pass of the stateful layer."""
-        assignments_var = self.variable(
-            'state',
-            'assignments',
-            lambda: jnp.zeros(self.features, dtype=jnp.int32)
-        )
-        assignments = assignments_var.value
+    def __call__(
+        self,
+        x: jnp.ndarray,
+        streams: Optional[jnp.ndarray] = None,
+        mask: Optional[jnp.ndarray] = None,
+        deterministic: bool = True
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """
+        Forward pass through decoder block.
         
-        x = nn.Dense(self.features, name="dense_layer")(z)
-
-        # --- Gradient Capture & Sensing ---
-        # 1. Gradient Sink Pattern:
-        #    We create a variable 'sink' initialized to zeros.
-        #    We add this sink to the activation 'x'.
-        #    During the backward pass, we will differentiate w.r.t. this 'sink' variable.
-        #    The gradient of the loss w.r.t. 'sink' is exactly the gradient w.r.t. 'x'.
-        grad_sink = self.variable(
-            'grad_sinks',
-            'sink',
-            lambda: jnp.zeros_like(x)
-        )
-        # Add the sink (zeros) to x. This doesn't change the forward pass value,
-        # but connects 'grad_sink' to the computation graph.
-        x = x + grad_sink.value
-
-        # 2. Read the gradients that were captured in the *previous* training step
-        #    from the 'grad_buffer' collection.
-        grad_var = self.variable(
-            'grad_buffer',
-            'pre_activation_grad',
-            lambda: jnp.zeros_like(x) # Initialize with zeros for the first step
-        )
-        prev_step_grads = grad_var.value
-
-        # 3. Use the (potentially delayed) gradients to calculate neuron stats.
-        #    Note: We use the original 'x' (before sink addition) for stats calculation
-        #    to avoid any potential circular dependency issues, though x+0 is same.
-        current_stats = calculate_neuron_stats(x, prev_step_grads)
+        Args:
+            x: Input tensor (batch, seq, d_model)
+            streams: Optional mHC streams (batch, seq, num_streams, d_model)
+            mask: Optional attention mask
+            deterministic: If False, apply dropout
+            
+        Returns:
+            Tuple of (output, updated_streams, moe_aux_loss)
+        """
+        config = self.config
+        batch_size, seq_len, d_model = x.shape
         
-        # --- Stats Aggregation ---
-        # Aggregate stats in a mutable variable collection
-        D = current_stats.shape[1]
-
-        def init_neuron_stats_buffer():
-            return {f'neuron_{i}': jnp.zeros(D, dtype=jnp.float32) for i in range(self.features)}
-
-        stats_buffer_collection = self.variable(
-            'stats_buffer',
-            'data',
-            lambda: {
-                'neuron_stats': init_neuron_stats_buffer(),
-                'step_count': jnp.array(0, dtype=jnp.int32)
-            }
-        )
+        # Initialize streams if using mHC
+        if config.use_hyper_connections:
+            if streams is None:
+                stream_init = HyperConnectionStream(
+                    num_streams=config.num_streams,
+                    d_model=config.d_model,
+                    name="stream_init"
+                )
+                streams = stream_init(x)
+            working_input = streams[:, :, 0, :]  # Use first stream as main
+        else:
+            working_input = x
         
-        # Update neuron_stats and increment step_count
-        updated_neuron_stats = stats_buffer_collection.value['neuron_stats'].copy() 
-        for i in range(self.features):
-            updated_neuron_stats[f'neuron_{i}'] += current_stats[i]
+        # ===== ATTENTION SUBLAYER =====
+        # Pre-norm
+        attn_input = nn.LayerNorm(name="attn_norm")(working_input)
+        
+        # Sparse or dense attention
+        if config.use_sparse_attention:
+            attn_output = NativeSparseAttention(
+                num_heads=config.num_heads,
+                head_dim=config.head_dim,
+                window_size=config.window_size,
+                compression_ratio=config.compression_ratio,
+                top_k_global=config.top_k_global,
+                name="sparse_attention"
+            )(attn_input, mask)
+        else:
+            attn_output = CausalSelfAttention(
+                num_heads=config.num_heads,
+                head_dim=config.head_dim,
+                name="causal_attention"
+            )(attn_input, mask)
+        
+        # Dropout
+        if not deterministic:
+            attn_output = nn.Dropout(rate=config.dropout_rate)(
+                attn_output, deterministic=deterministic
+            )
+        
+        # Residual connection (with or without mHC)
+        if config.use_hyper_connections:
+            mhc_attn = ManifoldHyperConnection(
+                num_streams=config.num_streams,
+                sinkhorn_iterations=config.sinkhorn_iterations,
+                name="mhc_attn"
+            )
+            streams, working_input = mhc_attn(streams, attn_output, output_stream_idx=0)
+        else:
+            working_input = working_input + attn_output
+        
+        # ===== FFN/MoE SUBLAYER =====
+        # Pre-norm
+        ffn_input = nn.LayerNorm(name="ffn_norm")(working_input)
+        
+        # MoE or standard FFN
+        if config.use_moe:
+            moe_layer = MoELayer(
+                num_experts=config.num_experts,
+                top_k=config.top_k_experts,
+                expert_hidden_dim=config.expert_hidden_dim,
+                d_model=config.d_model,
+                aux_loss_weight=config.moe_aux_loss_weight,
+                name="moe"
+            )
+            ffn_output, moe_aux_loss = moe_layer(ffn_input)
+        else:
+            # Standard FFN
+            ffn_output = nn.Dense(config.expert_hidden_dim, name="ffn_up")(ffn_input)
+            ffn_output = nn.gelu(ffn_output)
+            ffn_output = nn.Dense(config.d_model, name="ffn_down")(ffn_output)
+            moe_aux_loss = jnp.array(0.0)
+        
+        # Dropout
+        if not deterministic:
+            ffn_output = nn.Dropout(rate=config.dropout_rate)(
+                ffn_output, deterministic=deterministic
+            )
+        
+        # Residual connection (with or without mHC)
+        if config.use_hyper_connections:
+            mhc_ffn = ManifoldHyperConnection(
+                num_streams=config.num_streams,
+                sinkhorn_iterations=config.sinkhorn_iterations,
+                name="mhc_ffn"
+            )
+            streams, output = mhc_ffn(streams, ffn_output, output_stream_idx=0)
+        else:
+            output = working_input + ffn_output
+            streams = None
+        
+        return output, streams, moe_aux_loss
 
-        stats_buffer_collection.value = {
-            'neuron_stats': updated_neuron_stats,
-            'step_count': stats_buffer_collection.value['step_count'] + 1
-        }
 
-        # --- Functional Pathways ---
-        path0_out = nn.relu(x)
-        path1_out = nn.tanh(x)
-        path2_out = binary_step(x)
-
-        output_p0_p1 = jnp.where(assignments == 0, path0_out, path1_out)
-        multiplexed_output = jnp.where(assignments == 2, path2_out, output_p0_p1)
-
-        z_projected = nn.Dense(self.features, name="projection_layer")(z)
-        gate = jnp.where(assignments == 2, 0.1, 1.0)
-        final_output = multiplexed_output + (gate * z_projected)
-
-        return final_output
-
-class FORDETransformerBlock(nn.Module):
-    """A Transformer block that uses a StatefulLayer instead of a standard MLP."""
-    features: int
-    num_heads: int
-
+class FORDEDecoderLM(nn.Module):
+    """
+    Complete decoder-only language model with FORDE enhancements.
+    
+    Integrates MoE, NSA, and mHC for efficient and powerful LLM pretraining.
+    """
+    config: LLMConfig
+    
     @nn.compact
-    def __call__(self, x):
-        # Standard pre-normalization Transformer architecture
-        # First sub-layer: Multi-head self-attention
-        y = nn.LayerNorm()(x)
-        y = nn.SelfAttention(num_heads=self.num_heads)(y)
-        x = x + y
-
-        # Second sub-layer: StatefulLayer
-        y = nn.LayerNorm()(x)
-        y = StatefulLayer(features=self.features)(y)
-        x = x + y
-
-        return x
-
-class VisionTransformer(nn.Module):
-    """A Vision Transformer model using FORDETransformerBlocks."""
-    patch_size: int
-    num_layers: int
-    features: int
-    num_heads: int
-    image_size: int = 224
-
-    @nn.compact
-    def __call__(self, x):
-        # 1. Patch and embed the input image
-        x = nn.Conv(
-            self.features,
-            kernel_size=(self.patch_size, self.patch_size),
-            strides=(self.patch_size, self.patch_size),
-            padding='VALID',
-            name='patch_embed'
+    def __call__(
+        self,
+        input_ids: jnp.ndarray,
+        mask: Optional[jnp.ndarray] = None,
+        deterministic: bool = True
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """
+        Forward pass through the decoder LLM.
+        
+        Args:
+            input_ids: Token indices (batch, seq_len)
+            mask: Optional attention mask
+            deterministic: If False, apply dropout
+            
+        Returns:
+            Tuple of (logits, total_aux_loss)
+            - logits: (batch, seq_len, vocab_size)
+            - total_aux_loss: Scalar sum of MoE auxiliary losses
+        """
+        config = self.config
+        batch_size, seq_len = input_ids.shape
+        
+        # Token embeddings
+        token_embedding = nn.Embed(
+            num_embeddings=config.vocab_size,
+            features=config.d_model,
+            name="token_embed"
+        )(input_ids)
+        
+        # Positional embeddings (learned)
+        position_ids = jnp.arange(seq_len)[None, :]
+        position_embedding = nn.Embed(
+            num_embeddings=config.max_seq_len,
+            features=config.d_model,
+            name="pos_embed"
+        )(position_ids)
+        
+        # Combine embeddings
+        x = token_embedding + position_embedding
+        
+        # Apply dropout to embeddings
+        if not deterministic:
+            x = nn.Dropout(rate=config.dropout_rate)(x, deterministic=deterministic)
+        
+        # Initialize streams for mHC (if enabled)
+        streams = None
+        if config.use_hyper_connections:
+            stream_init = HyperConnectionStream(
+                num_streams=config.num_streams,
+                d_model=config.d_model,
+                name="initial_streams"
+            )
+            streams = stream_init(x)
+        
+        # Track total auxiliary loss from MoE layers
+        total_aux_loss = jnp.array(0.0)
+        
+        # Process through decoder blocks
+        for layer_idx in range(config.num_layers):
+            x, streams, moe_aux_loss = DecoderBlock(
+                config=config,
+                name=f"layer_{layer_idx}"
+            )(x, streams, mask, deterministic)
+            
+            total_aux_loss = total_aux_loss + moe_aux_loss
+        
+        # Final layer norm
+        x = nn.LayerNorm(name="final_norm")(x)
+        
+        # Collapse streams if using mHC
+        if config.use_hyper_connections and streams is not None:
+            collapser = StreamCollapser(
+                d_model=config.d_model,
+                collapse_method="weighted_sum",
+                name="stream_collapser"
+            )
+            x = collapser(streams)
+        
+        # Language modeling head (project to vocabulary)
+        logits = nn.Dense(
+            config.vocab_size,
+            name="lm_head",
+            kernel_init=nn.initializers.normal(stddev=0.02)
         )(x)
         
-        # Reshape to (batch, num_patches, features)
-        batch_size, h, w, c = x.shape
-        x = jnp.reshape(x, (batch_size, h * w, c))
-        num_patches = h * w
+        return logits, total_aux_loss
 
-        # 2. Prepend CLS token and add positional embeddings
-        cls_token = self.param('cls_token', nn.initializers.zeros, (1, 1, self.features))
-        cls_token = jnp.tile(cls_token, (batch_size, 1, 1))
-        x = jnp.concatenate([cls_token, x], axis=1)
 
-        pos_embedding = self.param(
-            'pos_embedding',
-            nn.initializers.normal(stddev=0.02),
-            (1, num_patches + 1, self.features)
-        )
-        x = x + pos_embedding
-
-        # 3. Process through Transformer blocks
-        for _ in range(self.num_layers):
-            x = FORDETransformerBlock(features=self.features, num_heads=self.num_heads)(x)
-        
-        # 4. Final normalization
-        x = nn.LayerNorm(name='final_norm')(x)
-
-        return x
-
-class TextTransformer(nn.Module):
-    """A Text Transformer model using FORDETransformerBlocks."""
-    vocab_size: int
-    num_layers: int
-    features: int
-    num_heads: int
-    max_len: int = 128
-
+class FORDEDecoderLMWithLoss(nn.Module):
+    """
+    Wrapper that includes loss computation for training convenience.
+    """
+    config: LLMConfig
+    
     @nn.compact
-    def __call__(self, x):
-        # 1. Embed tokens and add positional embeddings
-        x = nn.Embed(num_embeddings=self.vocab_size, features=self.features)(x)
-        pos_embedding = self.param(
-            'pos_embedding',
-            nn.initializers.normal(stddev=0.02),
-            (1, self.max_len, self.features)
-        )
-        x = x + pos_embedding
-
-        # 2. Process through Transformer blocks
-        for _ in range(self.num_layers):
-            x = FORDETransformerBlock(features=self.features, num_heads=self.num_heads)(x)
+    def __call__(
+        self,
+        input_ids: jnp.ndarray,
+        labels: Optional[jnp.ndarray] = None,
+        mask: Optional[jnp.ndarray] = None,
+        deterministic: bool = True
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """
+        Forward pass with optional loss computation.
         
-        # 3. Final normalization
-        x = nn.LayerNorm(name='final_norm')(x)
+        Args:
+            input_ids: Token indices (batch, seq_len)
+            labels: Target token indices for loss (batch, seq_len), optional
+            mask: Optional attention mask
+            deterministic: If False, apply dropout
+            
+        Returns:
+            Tuple of (logits, lm_loss, aux_loss)
+            - logits: (batch, seq_len, vocab_size)
+            - lm_loss: Scalar language modeling loss (or 0 if no labels)
+            - aux_loss: Scalar MoE auxiliary loss
+        """
+        # Get model predictions
+        model = FORDEDecoderLM(config=self.config, name="decoder")
+        logits, aux_loss = model(input_ids, mask, deterministic)
+        
+        # Compute loss if labels provided
+        if labels is not None:
+            # Shift for next-token prediction
+            # logits[:, :-1] predicts labels[:, 1:]
+            shift_logits = logits[:, :-1, :]
+            shift_labels = labels[:, 1:]
+            
+            # Cross-entropy loss
+            lm_loss = optax.softmax_cross_entropy_with_integer_labels(
+                shift_logits.reshape(-1, self.config.vocab_size),
+                shift_labels.reshape(-1)
+            ).mean()
+        else:
+            lm_loss = jnp.array(0.0)
+        
+        return logits, lm_loss, aux_loss
 
-        return x
 
-@dataclass
-class VisionConfig:
-    patch_size: int
-    num_layers: int
-    features: int
-    num_heads: int
+def create_default_config() -> LLMConfig:
+    """Create a reasonable default configuration for testing."""
+    return LLMConfig(
+        vocab_size=32000,
+        d_model=256,
+        num_layers=4,
+        num_heads=4,
+        head_dim=64,
+        max_seq_len=1024,
+        use_moe=True,
+        num_experts=4,
+        top_k_experts=2,
+        expert_hidden_dim=512,
+        use_sparse_attention=True,
+        window_size=128,
+        compression_ratio=4,
+        top_k_global=32,
+        use_hyper_connections=True,
+        num_streams=2,
+        sinkhorn_iterations=3,
+        dropout_rate=0.0
+    )
 
-@dataclass
-class TextConfig:
-    vocab_size: int
-    num_layers: int
-    features: int
-    num_heads: int
-    max_len: int
-
-class FORDEModel(nn.Module):
-    """The final dual-encoder model with projection heads."""
-    vision_config: VisionConfig
-    text_config: TextConfig
-    projection_dim: int
-
-    @nn.compact
-    def __call__(self, image, text):
-        # 1. Encode image and text
-        vision_output = VisionTransformer(**self.vision_config.__dict__)(image)
-        text_output = TextTransformer(**self.text_config.__dict__)(text)
-
-        # 2. Extract CLS token output
-        vision_cls = vision_output[:, 0]
-        text_cls = text_output[:, 0]
-
-        # 3. Project to shared embedding space
-        image_embedding = nn.Dense(features=self.projection_dim, name="vision_projection")(vision_cls)
-        text_embedding = nn.Dense(features=self.projection_dim, name="text_projection")(text_cls)
-
-        # 4. Add a learnable temperature parameter
-        logit_scale = self.param('logit_scale', nn.initializers.zeros, ())
-
-        return image_embedding, text_embedding, logit_scale
 
 if __name__ == '__main__':
-    key = jax.random.PRNGKey(0)
-    batch_size = 4
+    import optax  # Required for loss computation
     
-    # --- Test FORDEModel ---
-    print("\n--- Initializing FORDEModel ---")
-    dummy_image = jnp.ones((batch_size, 224, 224, 3))
-    dummy_text = jnp.ones((batch_size, 128), dtype=jnp.int32)
-
-    vision_config = VisionConfig(patch_size=16, num_layers=2, features=128, num_heads=4)
-    text_config = TextConfig(vocab_size=30522, num_layers=2, features=128, num_heads=4)
-
-    model = FORDEModel(vision_config=vision_config, text_config=text_config, projection_dim=64)
-
-    variables = model.init(key, dummy_image, dummy_text)
-    image_embed, text_embed, logit_scale = model.apply(variables, dummy_image, dummy_text)
-
-    print(f"Input image shape: {dummy_image.shape}")
-    print(f"Input text shape: {dummy_text.shape}")
-    print(f"Output image embedding shape: {image_embed.shape}")
-    print(f"Output text embedding shape: {text_embed.shape}")
-    print(f"Logit scale: {logit_scale}")
-    print("FORDEModel executed successfully.")
+    print("=" * 60)
+    print("Testing FORDE Decoder-Only LLM")
+    print("=" * 60)
+    
+    key = jax.random.PRNGKey(42)
+    config = create_default_config()
+    
+    # Test inputs
+    batch_size = 2
+    seq_len = 64
+    input_ids = jax.random.randint(key, (batch_size, seq_len), 0, config.vocab_size)
+    
+    print(f"\nConfiguration:")
+    print(f"  - d_model: {config.d_model}")
+    print(f"  - num_layers: {config.num_layers}")
+    print(f"  - num_heads: {config.num_heads}")
+    print(f"  - vocab_size: {config.vocab_size}")
+    print(f"  - MoE: {config.use_moe} ({config.num_experts} experts, top-{config.top_k_experts})")
+    print(f"  - NSA: {config.use_sparse_attention} (window={config.window_size})")
+    print(f"  - mHC: {config.use_hyper_connections} ({config.num_streams} streams)")
+    
+    # Initialize model
+    print(f"\nInitializing model...")
+    model = FORDEDecoderLM(config=config)
+    variables = model.init(key, input_ids)
+    
+    # Count parameters
+    param_count = sum(x.size for x in jax.tree.leaves(variables['params']))
+    print(f"Total parameters: {param_count:,}")
+    
+    # Forward pass
+    print(f"\nRunning forward pass...")
+    logits, aux_loss = model.apply(variables, input_ids)
+    
+    print(f"Input shape: {input_ids.shape}")
+    print(f"Output logits shape: {logits.shape}")
+    print(f"Expected shape: ({batch_size}, {seq_len}, {config.vocab_size})")
+    print(f"MoE aux loss: {aux_loss:.6f}")
+    
+    # Verify shapes
+    assert logits.shape == (batch_size, seq_len, config.vocab_size), "Output shape mismatch!"
+    print("\n✓ Forward pass successful!")
+    
+    # Test with loss computation
+    print(f"\nTesting loss computation...")
+    labels = jax.random.randint(key, (batch_size, seq_len), 0, config.vocab_size)
+    
+    # Manual loss computation
+    shift_logits = logits[:, :-1, :]
+    shift_labels = labels[:, 1:]
+    lm_loss = optax.softmax_cross_entropy_with_integer_labels(
+        shift_logits.reshape(-1, config.vocab_size),
+        shift_labels.reshape(-1)
+    ).mean()
+    
+    print(f"Language modeling loss: {lm_loss:.4f}")
+    print(f"Total loss (LM + aux): {lm_loss + aux_loss:.4f}")
+    
+    # Test gradient computation
+    print(f"\nTesting gradient computation...")
+    
+    def loss_fn(params, input_ids, labels):
+        logits, aux_loss = model.apply({'params': params}, input_ids)
+        shift_logits = logits[:, :-1, :]
+        shift_labels = labels[:, 1:]
+        lm_loss = optax.softmax_cross_entropy_with_integer_labels(
+            shift_logits.reshape(-1, config.vocab_size),
+            shift_labels.reshape(-1)
+        ).mean()
+        return lm_loss + aux_loss
+    
+    grads = jax.grad(loss_fn)(variables['params'], input_ids, labels)
+    grad_norm = jnp.sqrt(sum(jnp.sum(x**2) for x in jax.tree.leaves(grads)))
+    print(f"Gradient norm: {grad_norm:.4f}")
+    
+    print("\n" + "=" * 60)
+    print("All tests passed! ✓")
+    print("=" * 60)

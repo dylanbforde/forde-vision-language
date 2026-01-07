@@ -1,349 +1,346 @@
+"""
+LLM Pretraining Script for FORDE Decoder Model.
+
+This training script supports:
+- Next-token prediction language modeling loss
+- MoE auxiliary load balancing loss
+- Configurable model architecture (MoE, NSA, mHC)
+- Streaming dataset loading
+"""
+
 import jax
 import jax.numpy as jnp
 import optax
-import torch
-from torch.utils.data import DataLoader
 from flax.training import train_state
 from flax.core import unfreeze
-from transformers import AutoTokenizer
 from tqdm.auto import tqdm
 import argparse
-import itertools
+from dataclasses import asdict
+from typing import Dict, Any
 
-# Assuming the script is run from the project root
-from src.data.dataset import create_dataset, MAX_TEXT_LENGTH
-from src.forde.model import FORDEModel, VisionConfig, TextConfig
-from src.forde.sensing import calculate_neuron_stats
-from src.forde.clustering import cluster_neurons_gmm as cluster_neurons
-from src.forde.smoothing import assignments_to_grid, smooth_assignments
-from src.forde.actuation import update_neuron_assignments
+# Handle imports
+try:
+    from src.forde.model import FORDEDecoderLM, LLMConfig, create_default_config
+    from src.data.dataset import create_lm_dataset, create_dummy_dataset
+except ModuleNotFoundError:
+    import sys
+    sys.path.insert(0, '/home/dylan/code/python/functional-organisation')
+    from src.forde.model import FORDEDecoderLM, LLMConfig, create_default_config
+    from src.data.dataset import create_lm_dataset, create_dummy_dataset
+
 
 class TrainState(train_state.TrainState):
-    # We can add more things to the state here later, like metrics
-    pass
+    """Extended train state to track auxiliary losses and mutable stats."""
+    stats_buffer: Dict[str, Any]
 
-def create_train_state(model_cls, key, learning_rate, dummy_image, dummy_text, vision_config, text_config, projection_dim):
-    """Creates initial TrainState and mutable variables."""
-    model = model_cls(
-        vision_config=vision_config,
-        text_config=text_config,
-        projection_dim=projection_dim
+
+def create_train_state(
+    config: LLMConfig,
+    key: jax.random.PRNGKey,
+    learning_rate: float,
+    weight_decay: float = 0.01
+):
+    """Create training state with model and optimizer."""
+    model = FORDEDecoderLM(config=config)
+    
+    # Initialize with dummy input
+    dummy_input = jnp.ones((1, 64), dtype=jnp.int32)
+    variables = model.init(key, dummy_input)
+    params = variables['params']
+    
+    # Extract mutable state (stats_buffer)
+    mutable_vars = {k: v for k, v in variables.items() if k != 'params'}
+    if 'stats_buffer' not in mutable_vars:
+        mutable_vars['stats_buffer'] = {}
+    
+    # Create optimizer with weight decay
+    tx = optax.chain(
+        optax.clip_by_global_norm(1.0),  # Gradient clipping
+        optax.adamw(learning_rate, weight_decay=weight_decay)
     )
     
-    # Initialize the model parameters and all mutable variables (state, stats_buffer)
-    variables = model.init(key, dummy_image, dummy_text)
-    params = variables['params']
+    return TrainState.create(
+        apply_fn=model.apply,
+        params=params,
+        tx=tx,
+        stats_buffer=mutable_vars['stats_buffer']
+    )
 
-    # Ensure parameters are float32 for gradient computation
-    params = jax.tree.map(lambda x: x.astype(jnp.float32) if jnp.issubdtype(x.dtype, jnp.integer) else x, params)
-    mutable_variables = {k: v for k, v in variables.items() if k != 'params'}
 
-    # Ensure mutable_variables are also float32 for gradient computation compatibility
-    mutable_variables = jax.tree.map(lambda x: x.astype(jnp.float32) if jnp.issubdtype(x.dtype, jnp.integer) else x, mutable_variables)
-
-    # Create an optimizer
-    tx = optax.adam(learning_rate)
-
-    # Create and return the training state and initial mutable variables
-    return TrainState.create(apply_fn=model.apply, params=params, tx=tx), mutable_variables
-
-from flax.core import unfreeze
-
-def train_step(state, mutable_variables, batch):
+def compute_loss(
+    params,
+    stats_buffer,
+    apply_fn,
+    input_ids: jnp.ndarray,
+    vocab_size: int,
+    aux_loss_weight: float = 1.0
+):
     """
-    Performs a single training step, including gradient capture and cycling.
-    This function is not JIT-compiled itself, but orchestrates JIT-compiled sub-functions.
+    Compute language modeling loss with MoE auxiliary loss.
     """
+    # Pass mutable stats_buffer to capture updates
+    # We need to pass 'stats_buffer' in mutable list to get it back
+    (logits, aux_loss), new_mutable_vars = apply_fn(
+        {'params': params, 'stats_buffer': stats_buffer}, 
+        input_ids,
+        mutable=['stats_buffer']
+    )
     
-    # Define the loss function for both parameter and intermediate gradient calculation.
-    def loss_fn(params, mutable_vars, batch):
-        # Collections to be made mutable during the apply call.
-        # We include 'grad_sinks' here because we might want to update them (though they are just sinks)
-        # but crucially, we need to pass them in.
-        mutable_collections = ['state', 'stats_buffer', 'grad_buffer', 'grad_sinks']
-        
-        (image_embed, text_embed, logit_scale), updated_vars = state.apply_fn(
-            {'params': params, **mutable_vars},
-            batch['image'],
-            batch['input_ids'],
-            mutable=mutable_collections
-        )
-
-        # Contrastive loss calculation
-        image_embed = image_embed / jnp.linalg.norm(image_embed, axis=-1, keepdims=True)
-        text_embed = text_embed / jnp.linalg.norm(text_embed, axis=-1, keepdims=True)
-        logits = jnp.matmul(image_embed, text_embed.T) * jnp.exp(logit_scale)
-        labels = jnp.arange(batch['image'].shape[0])
-        image_loss = optax.softmax_cross_entropy_with_integer_labels(logits, labels).mean()
-        text_loss = optax.softmax_cross_entropy_with_integer_labels(logits.T, labels).mean()
-        total_loss = (image_loss + text_loss) / 2
-        
-        # Return loss and the sown activations as auxiliary data for grad calculation
-        return total_loss, (updated_vars, updated_vars.get('activations_to_grad'))
-
-    # JIT-compile the function that calculates gradients.
-    # argnums=0: gradients w.r.t. params
-    # argnums=1: gradients w.r.t. mutable_variables (specifically 'grad_sinks' inside it)
-    # We need to restructure how we pass arguments to differentiate w.r.t. a subset of mutable_variables.
-    # To make it cleaner, we can split mutable_variables.
+    # Shift for next-token prediction
+    shift_logits = logits[:, :-1, :]
+    shift_labels = input_ids[:, 1:]
     
-    # Helper wrapper to handle the splitting of mutable variables
-    def loss_wrapper(params, grad_sinks, other_mutable_vars, batch):
-        # Recombine variables
-        all_mutable_vars = {**other_mutable_vars, 'grad_sinks': grad_sinks}
-        return loss_fn(params, all_mutable_vars, batch)
-
-    grad_fn = jax.value_and_grad(loss_wrapper, argnums=(0, 1), has_aux=True)
-
-    # Separate 'grad_sinks' from other mutable variables
-    grad_sinks = mutable_variables.pop('grad_sinks')
-    other_mutable_vars = mutable_variables
-
-    # --- Execute the training step ---
+    # Cross-entropy loss
+    lm_loss = optax.softmax_cross_entropy_with_integer_labels(
+        shift_logits.reshape(-1, vocab_size),
+        shift_labels.reshape(-1)
+    ).mean()
     
-    # 1. Calculate loss, parameter gradients, and sink gradients
-    (loss, (updated_mutable_vars, _)), (param_grads, sink_grads) = grad_fn(state.params, grad_sinks, other_mutable_vars, batch)
+    total_loss = lm_loss + aux_loss_weight * aux_loss
     
-    # The 'sink_grads' are the gradients of the loss w.r.t. the 'grad_sinks' variables.
-    # Since 'grad_sinks' were added to activations, these are exactly dL/d(activation).
-    intermediate_grads = sink_grads 
-
-    # 2. Apply parameter gradients to the optimizer state
-    state = state.apply_gradients(grads=param_grads)
-
-    # 3. Cycle the intermediate gradients for the next step.
-    # We take the intermediate gradients we just calculated and put them
-    # into the 'grad_buffer' for the next iteration to use.
-    # Note: updated_mutable_vars contains the updated state/stats_buffer/grad_buffer/grad_sinks
-    mutable_variables = unfreeze(updated_mutable_vars)
-    
-    # We need to map the structure of intermediate_grads (which is {'sink': ...}) 
-    # to the structure of grad_buffer (which is {'pre_activation_grad': ...})
-    # The structure of the pytree should be identical down to the leaf names.
-    
-    def map_sink_to_buffer(sink_grad_leaf):
-        return sink_grad_leaf
-
-    # We assume the tree structure of 'grad_sinks' matches 'grad_buffer' 
-    # except for the leaf name ('sink' vs 'pre_activation_grad').
-    # However, JAX tree_map works on structure.
-    # Let's manually traverse or assume the model structure ensures alignment.
-    # A safer way is to traverse the 'grad_buffer' in mutable_variables and fill it.
-    
-    # Actually, the simplest way is to realize that 'intermediate_grads' is a dictionary 
-    # mirroring the model structure. We can just iterate and assign.
-    # But since we are using Flax variables, we can try to just swap the collection.
-    # But the collection names are different in the variable definition ('grad_sinks' vs 'grad_buffer').
-    # And the variable names are different ('sink' vs 'pre_activation_grad').
-    
-    # Let's use a recursive update that ignores the specific leaf key name
-    def update_grad_buffer(buffer_tree, sink_tree):
-        if isinstance(buffer_tree, dict) and isinstance(sink_tree, dict):
-            # If we are at the leaf container level
-            if 'pre_activation_grad' in buffer_tree and 'sink' in sink_tree:
-                buffer_tree['pre_activation_grad'] = sink_tree['sink']
-            else:
-                for k in buffer_tree.keys():
-                    if k in sink_tree:
-                        update_grad_buffer(buffer_tree[k], sink_tree[k])
-        return buffer_tree
-
-    if intermediate_grads:
-        mutable_variables['grad_buffer'] = update_grad_buffer(mutable_variables['grad_buffer'], intermediate_grads)
-    
-    return state, mutable_variables, loss
-
-def slow_loop_step(mutable_variables, vision_config, text_config, projection_dim, key, epoch, step):
-    """Performs the FORDE slow loop: sense, cluster, smooth, actuate."""
-    print("--- Running Slow Loop ---")
-
-    # Helper to recursively find all 'data' dictionaries for stats
-    def get_all_stats_data(pytree):
-        all_data = []
-        if isinstance(pytree, dict):
-            # Using 'neuron_stats' as a unique marker for the dictionary we want
-            if 'neuron_stats' in pytree and 'step_count' in pytree:
-                all_data.append(pytree)
-            else:
-                for k in sorted(pytree.keys()): # Sort keys for deterministic order
-                    all_data.extend(get_all_stats_data(pytree[k]))
-        return all_data
-
-    # 1. Sense: Aggregate statistics from all StatefulLayers
-    all_stats_data_list = get_all_stats_data(mutable_variables['stats_buffer'])
-
-    if not all_stats_data_list:
-        print("Could not find any stats data, skipping slow loop.")
-        return mutable_variables, jnp.array([])
-
-    # All step_counts should be the same, take the first one.
-    step_count = all_stats_data_list[0]['step_count']
-    if step_count == 0:
-        print("Stats buffer is empty (step_count is 0), skipping slow loop.")
-        return mutable_variables, jnp.array([])
-
-    # Define the aggregation and resizing function for each neuron's accumulated stats
-    def aggregate_and_resize_per_neuron(neuron_accumulated_stats):
-        mean_stats = neuron_accumulated_stats / step_count
-        current_dim = mean_stats.shape[0]
-        if current_dim < projection_dim:
-            padding_needed = projection_dim - current_dim
-            return jnp.pad(mean_stats, (0, padding_needed), 'constant')
-        elif current_dim > projection_dim:
-            return mean_stats[:projection_dim]
-        else:
-            return mean_stats
-
-    # Apply aggregation to all collected neuron stats
-    all_aggregated_stats = []
-    for stats_data in all_stats_data_list:
-        aggregated_dict = jax.tree.map(aggregate_and_resize_per_neuron, stats_data['neuron_stats'])
-        # .values() are the arrays for each neuron, sort keys to be safe
-        all_aggregated_stats.extend([aggregated_dict[k] for k in sorted(aggregated_dict.keys())])
-
-    flattened_stats = jnp.stack(all_aggregated_stats, axis=0)
-
-    # 2. Cluster: Run GMM on aggregated stats
-    assignments, gmm = cluster_neurons(flattened_stats, num_clusters=3, random_key=key)
-    print(f"Clustering complete. Neuron assignments shape: {assignments.shape}")
-
-    # 3. Smooth: Apply convolutional smoothing
-    num_neurons = flattened_stats.shape[0]
-    
-    # Find factors for a rectangular grid that is as square as possible
-    r = int(jnp.sqrt(num_neurons))
-    while num_neurons % r != 0:
-        r -= 1
-    c = num_neurons // r
-    grid_size = (r, c)
-
-    assignment_grid = assignments_to_grid(assignments, grid_size)
-
-    kernel_size = 3
-    num_clusters = 3
-    
-    smoothed_assignments_grid = smooth_assignments(assignment_grid, kernel_size=kernel_size, num_clusters=num_clusters)
-    
-    # --- Diagnostics ---
-    from src.utils.logging import plot_brain_scan, plot_feature_space
-    plot_brain_scan(smoothed_assignments_grid, step, epoch)
-    plot_feature_space(flattened_stats, assignments, step, epoch)
-    # --- End Diagnostics ---
-
-    # Reshape back to 1D
-    smoothed_assignments = smoothed_assignments_grid.flatten()
-    print("Smoothing complete.")
-
-    # 4. Actuate: Update neuron assignments in the model state
-    print("Actuation complete.")
-    
-    # Call the new update_neuron_assignments function
-    mutable_variables = update_neuron_assignments(mutable_variables, smoothed_assignments)
-    
-    # 5. Reset Stats Buffer
-    # We need to reset the stats buffer to zeros for the next cycle.
-    # We can use the same structure as the input but filled with zeros.
-    
-    def reset_leaf(x):
-        return jnp.zeros_like(x)
-        
-    reset_stats_buffer = jax.tree.map(reset_leaf, mutable_variables['stats_buffer'])
-    mutable_variables['stats_buffer'] = reset_stats_buffer
-    print("Stats buffer reset.")
-
-    return mutable_variables, smoothed_assignments
-
-def collate_fn(examples):
-    """Custom collate function to handle dictionary-based batches."""
-    batch = {
-        'image': jnp.stack([ex['image'] for ex in examples]),
-        'input_ids': jnp.stack([ex['input_ids'] for ex in examples]),
+    metrics = {
+        'lm_loss': lm_loss,
+        'aux_loss': aux_loss,
+        'total_loss': total_loss
     }
-    return batch
+    
+    return total_loss, (metrics, new_mutable_vars)
+
+
+@jax.jit
+def train_step(state, batch, vocab_size, aux_loss_weight):
+    """JIT-compiled training step.
+    
+    Note: vocab_size and aux_loss_weight must be concrete/static values.
+    The function is recompiled for each unique combination of these values.
+    """
+    
+    def loss_fn(params):
+        # We need to capture the updated stats_buffer here
+        # But jax.value_and_grad only returns the first output of the function
+        # So we need to bundle everything into the return value
+        
+        (logits, aux_loss), new_mutable_vars = state.apply_fn(
+            {'params': params, 'stats_buffer': state.stats_buffer}, 
+            batch['input_ids'],
+            mutable=['stats_buffer']
+        )
+        
+        # Shift for next-token prediction
+        shift_logits = logits[:, :-1, :]
+        shift_labels = batch['input_ids'][:, 1:]
+        
+        # Get vocab size from logits shape (static at trace time)
+        v_size = shift_logits.shape[-1]
+        
+        # Cross-entropy loss
+        lm_loss = optax.softmax_cross_entropy_with_integer_labels(
+            shift_logits.reshape(-1, v_size),
+            shift_labels.reshape(-1)
+        ).mean()
+        
+        total_loss = lm_loss + aux_loss_weight * aux_loss
+        
+        metrics = {
+            'lm_loss': lm_loss,
+            'aux_loss': aux_loss,
+            'total_loss': total_loss
+        }
+        
+        return total_loss, (metrics, new_mutable_vars)
+    
+    (loss, (metrics, new_mutable_vars)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+    state = state.apply_gradients(grads=grads)
+    
+    # Update stats_buffer in state
+    state = state.replace(stats_buffer=new_mutable_vars['stats_buffer'])
+    
+    # Compute gradient norm for monitoring
+    grad_norm = jnp.sqrt(sum(jnp.sum(x**2) for x in jax.tree.leaves(grads)))
+    metrics['grad_norm'] = grad_norm
+    
+    return state, metrics
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Train FORDE model")
-    parser.add_argument("--num_epochs", type=int, default=10, help="Number of epochs")
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
-    parser.add_argument("--num_workers", type=int, default=4, help="Number of dataloader workers")
-    parser.add_argument("--max_steps", type=int, default=None, help="Max steps per epoch")
-    parser.add_argument("--slow_loop_freq", type=int, default=150, help="Frequency of slow loop")
+    parser = argparse.ArgumentParser(description="Train FORDE LLM")
+    
+    # Training arguments
+    parser.add_argument("--num_epochs", type=int, default=1, help="Number of epochs")
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
+    parser.add_argument("--max_steps", type=int, default=1000, help="Max steps per epoch")
+    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
+    parser.add_argument("--aux_loss_weight", type=float, default=0.01, help="MoE aux loss weight")
+    parser.add_argument("--log_interval", type=int, default=10, help="Steps between logging")
+    
+    # Model arguments
+    parser.add_argument("--d_model", type=int, default=256, help="Model dimension")
+    parser.add_argument("--num_layers", type=int, default=4, help="Number of layers")
+    parser.add_argument("--num_heads", type=int, default=4, help="Number of attention heads")
+    parser.add_argument("--num_experts", type=int, default=4, help="Number of MoE experts")
+    parser.add_argument("--window_size", type=int, default=128, help="NSA window size")
+    parser.add_argument("--max_seq_len", type=int, default=512, help="Maximum sequence length")
+    
+    # Feature flags
+    parser.add_argument("--no_moe", action="store_true", help="Disable MoE")
+    parser.add_argument("--no_nsa", action="store_true", help="Disable sparse attention")
+    parser.add_argument("--no_mhc", action="store_true", help="Disable hyper-connections")
+    parser.add_argument("--use_dummy_data", action="store_true", help="Use dummy data for testing")
+    parser.add_argument("--slow_loop_interval", type=int, default=100, help="Steps between slow loop runs (0 to disable)")
+    
     args = parser.parse_args()
-
-    # --- Configuration ---
-    learning_rate = 1e-4
-    num_epochs = args.num_epochs
-    slow_loop_freq = args.slow_loop_freq
-    batch_size = args.batch_size
-    features = 128 # Embedding dimension for transformers
-    projection_dim = 64 # Dimension of the shared embedding space
-
-    # Model configurations
-    vision_config = VisionConfig(
-        patch_size=16,
-        num_layers=2,
-        features=features,
-        num_heads=4
-    )
-    text_config = TextConfig(
-        vocab_size=30522, # BERT vocab size
-        num_layers=2,
-        features=features,
-        num_heads=4,
-        max_len=MAX_TEXT_LENGTH
-    )
-
-    # --- Initialization ---
-    key = jax.random.PRNGKey(0)
     
-    # 1. Initialize Model and Train State
-    dummy_image = jnp.ones((batch_size, 224, 224, 3))
-    dummy_text = jnp.ones((batch_size, MAX_TEXT_LENGTH), dtype=jnp.int32)
-    
-    state, mutable_variables = create_train_state(
-        FORDEModel, key, learning_rate, dummy_image, dummy_text,
-        vision_config, text_config, projection_dim
+    # Build config
+    config = LLMConfig(
+        vocab_size=32000,
+        d_model=args.d_model,
+        num_layers=args.num_layers,
+        num_heads=args.num_heads,
+        head_dim=args.d_model // args.num_heads,
+        max_seq_len=args.max_seq_len,
+        use_moe=not args.no_moe,
+        num_experts=args.num_experts,
+        top_k_experts=2,
+        expert_hidden_dim=args.d_model * 4,
+        use_sparse_attention=not args.no_nsa,
+        window_size=args.window_size,
+        compression_ratio=4,
+        top_k_global=32,
+        use_hyper_connections=not args.no_mhc,
+        num_streams=2,
+        sinkhorn_iterations=3,
+        dropout_rate=0.0  # No dropout for now
     )
-    print(f"Train state and mutable variables created. Mutable variable keys: {mutable_variables.keys()}")
-
-    # 2. Initialize Dataset and DataLoader
-    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-    dataset = create_dataset(tokenizer)
-    dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn, num_workers=args.num_workers)
-    print(f"DataLoader num_workers: {dataloader.num_workers}")
-    print("DataLoader created.")
-
-    # --- Training Loop ---
-    print("Starting training loop...")
+    
+    print("=" * 60)
+    print("FORDE LLM Training")
+    print("=" * 60)
+    print(f"\nModel Configuration:")
+    for key, value in asdict(config).items():
+        print(f"  {key}: {value}")
+    
+    # Initialize
+    key = jax.random.PRNGKey(42)
+    key, init_key, data_key = jax.random.split(key, 3)
+    
+    print(f"\nInitializing model...")
+    state = create_train_state(config, init_key, args.learning_rate, args.weight_decay)
+    
+    param_count = sum(x.size for x in jax.tree.leaves(state.params))
+    print(f"Total parameters: {param_count:,}")
+    
+    # Create dataset
+    print(f"\nCreating dataset...")
+    if args.use_dummy_data:
+        dataset = create_dummy_dataset(
+            vocab_size=config.vocab_size,
+            seq_len=args.max_seq_len,
+            num_samples=args.batch_size * args.max_steps
+        )
+    else:
+        try:
+            dataset = create_lm_dataset(
+                vocab_size=config.vocab_size,
+                max_seq_len=args.max_seq_len
+            )
+        except Exception as e:
+            print(f"Failed to load dataset: {e}")
+            print("Falling back to dummy data...")
+            dataset = create_dummy_dataset(
+                vocab_size=config.vocab_size,
+                seq_len=args.max_seq_len,
+                num_samples=args.batch_size * args.max_steps
+            )
+    
+    # Training loop
+    print(f"\nStarting training...")
+    print(f"  Epochs: {args.num_epochs}")
+    print(f"  Batch size: {args.batch_size}")
+    print(f"  Max steps: {args.max_steps}")
+    print(f"  Slow loop interval: {args.slow_loop_interval} steps")
+    
     step = 0
-    for epoch in range(num_epochs):
-        epoch_iterator = dataloader
-        if args.max_steps is not None:
-            epoch_iterator = itertools.islice(dataloader, args.max_steps)
-
-        for batch in tqdm(epoch_iterator, desc=f"Epoch {epoch+1}/{num_epochs}", total=args.max_steps):
-            state, mutable_variables, loss = train_step(state, mutable_variables, batch)
-
-            if step % 5 == 0: # Increased frequency for loss printing
-                print(f"Step {step}, Epoch {epoch}, Loss: {loss}")
-
-            # --- Slow Loop ---
-            if (step + 1) % slow_loop_freq == 0: # Run slow loop every slow_loop_freq steps
-                key, slow_loop_key = jax.random.split(key)
-                updated_mutable_variables, new_assignments = slow_loop_step(mutable_variables, vision_config, text_config, projection_dim, slow_loop_key, epoch, step)
+    for epoch in range(args.num_epochs):
+        print(f"\n--- Epoch {epoch + 1}/{args.num_epochs} ---")
+        
+        # Create batches
+        epoch_iterator = dataset.batch(args.batch_size)
+        
+        pbar = tqdm(epoch_iterator, total=args.max_steps, desc=f"Epoch {epoch + 1}")
+        
+        for batch in pbar:
+            if step >= args.max_steps:
+                break
+            
+            # Ensure batch is properly formatted
+            if isinstance(batch, dict):
+                input_ids = jnp.array(batch['input_ids'])
+            else:
+                input_ids = jnp.array(batch)
+            
+            # Truncate if needed
+            if input_ids.shape[1] > args.max_seq_len:
+                input_ids = input_ids[:, :args.max_seq_len]
+            
+            batch_dict = {'input_ids': input_ids}
+            
+            # Training step
+            state, metrics = train_step(
+                state, batch_dict, config.vocab_size, args.aux_loss_weight
+            )
+            
+            # Logging
+            if step % args.log_interval == 0:
+                pbar.set_postfix({
+                    'loss': f"{metrics['total_loss']:.4f}",
+                    'lm': f"{metrics['lm_loss']:.4f}",
+                    'aux': f"{metrics['aux_loss']:.4f}",
+                    'gnorm': f"{metrics['grad_norm']:.2f}"
+                })
+            
+            # Run slow loop periodically
+            if args.slow_loop_interval > 0 and step > 0 and step % args.slow_loop_interval == 0:
+                key, slow_key = jax.random.split(key)
                 
-                mutable_variables = updated_mutable_variables # Update mutable_variables in main scope
-
-                # The actuation step is now handled within slow_loop_step
-                # The line below is no longer needed if update_neuron_assignments is called inside slow_loop_step
-                # state = update_neuron_assignments(state, new_assignments)
-                print("Model state updated with new assignments.")
+                # Import slow loop
+                try:
+                    from src.forde.moe_slow_loop import moe_slow_loop_step
+                except ModuleNotFoundError:
+                    import sys
+                    sys.path.insert(0, '/home/dylan/code/python/functional-organisation')
+                    from src.forde.moe_slow_loop import moe_slow_loop_step
+                
+                print(f"\n[Step {step}] Running slow loop...")
+                
+                # Execute slow loop
+                # This updates params (router biases) and resets stats_buffer
+                new_params, new_mutable_vars, diagnostics = moe_slow_loop_step(
+                    model_params=state.params,
+                    mutable_variables={'stats_buffer': state.stats_buffer},
+                    config=config,
+                    key=slow_key,
+                    epoch=epoch,
+                    step=step
+                )
+                
+                # Update state
+                state = state.replace(
+                    params=new_params,
+                    stats_buffer=new_mutable_vars['stats_buffer']
+                )
+                
+                if 'skipped' not in diagnostics:
+                    print(f"  Slow loop complete. Router adjustments applied.")
             
             step += 1
+        
+        print(f"Epoch {epoch + 1} complete. Final loss: {metrics['total_loss']:.4f}")
+    
+    print(f"\n" + "=" * 60)
+    print("Training complete!")
+    print("=" * 60)
+
 
 if __name__ == "__main__":
-    try:
-        torch.multiprocessing.set_start_method('spawn')
-    except RuntimeError:
-        pass
     main()
