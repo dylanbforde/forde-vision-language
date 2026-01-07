@@ -16,6 +16,7 @@ from tqdm.auto import tqdm
 import argparse
 from dataclasses import asdict
 from typing import Dict, Any
+from datetime import datetime
 
 # Handle imports
 try:
@@ -227,6 +228,12 @@ def main():
         default="checkpoints",
         help="Directory to save checkpoints",
     )
+    parser.add_argument(
+        "--experiment_name",
+        type=str,
+        default="forde_llm",
+        help="Name for the TensorBoard experiment",
+    )
     args = parser.parse_args()
 
     # Build config
@@ -271,7 +278,10 @@ def main():
     # TensorBoard logging
     writer = None
     if HAS_TENSORBOARD:
-        writer = SummaryWriter(log_dir="runs/forde_llm_experiment")
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        log_dir = f"runs/{args.experiment_name}_{timestamp}"
+        print(f"Logging to: {log_dir}")
+        writer = SummaryWriter(log_dir=log_dir)
 
     # Create dataset
     print(f"\nCreating dataset...")
