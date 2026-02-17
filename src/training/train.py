@@ -20,7 +20,7 @@ from datetime import datetime
 
 # Handle imports
 try:
-    from src.forde.model import FORDEDecoderLM, LLMConfig, create_default_config
+    from src.forde.model import FORDEDecoderLM, LLMConfig
     from src.data.dataset import create_lm_dataset, create_dummy_dataset
 except ModuleNotFoundError:
     import sys
@@ -261,7 +261,7 @@ def main():
     print("=" * 60)
     print("FORDE LLM Training")
     print("=" * 60)
-    print(f"\nModel Configuration:")
+    print("\nModel Configuration:")
     for key, value in asdict(config).items():
         print(f"  {key}: {value}")
 
@@ -269,7 +269,7 @@ def main():
     key = jax.random.PRNGKey(42)
     key, init_key, data_key = jax.random.split(key, 3)
 
-    print(f"\nInitializing model...")
+    print("\nInitializing model...")
     state = create_train_state(config, init_key, args.learning_rate, args.weight_decay)
 
     param_count = sum(x.size for x in jax.tree.leaves(state.params))
@@ -284,7 +284,7 @@ def main():
         writer = SummaryWriter(log_dir=log_dir)
 
     # Create dataset
-    print(f"\nCreating dataset...")
+    print("\nCreating dataset...")
     if args.use_dummy_data:
         dataset = create_dummy_dataset(
             vocab_size=config.vocab_size,
@@ -306,7 +306,7 @@ def main():
             )
 
     # Training loop
-    print(f"\nStarting training...")
+    print("\nStarting training...")
     print(f"  Epochs: {args.num_epochs}")
     print(f"  Batch size: {args.batch_size}")
     print(f"  Max steps: {args.max_steps}")
@@ -399,13 +399,13 @@ def main():
                 )
 
                 if "skipped" not in diagnostics:
-                    print(f"  Slow loop complete. Router adjustments applied.")
+                    print("  Slow loop complete. Router adjustments applied.")
 
             step += 1
 
         print(f"Epoch {epoch + 1} complete. Final loss: {metrics['total_loss']:.4f}")
 
-    print(f"\n" + "=" * 60)
+    print("\n" + "=" * 60)
     print("Training complete!")
     print("=" * 60)
 

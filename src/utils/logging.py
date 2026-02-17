@@ -1,19 +1,23 @@
 import matplotlib.pyplot as plt
 import seaborn as sns
-import jax.numpy as jnp
-import numpy as np # For converting JAX arrays to NumPy for plotting
+
+import numpy as np  # For converting JAX arrays to NumPy for plotting
+
 
 def plot_brain_scan(smoothed_assignments_grid, step, epoch):
     """
     Generates and saves a heatmap of the smoothed neuron assignments (Brain Scan).
     """
     plt.figure(figsize=(8, 8))
-    sns.heatmap(np.asarray(smoothed_assignments_grid), cmap='viridis', cbar=True, square=True)
+    sns.heatmap(
+        np.asarray(smoothed_assignments_grid), cmap="viridis", cbar=True, square=True
+    )
     plt.title(f"Brain Scan - Smoothed Assignments (Epoch {epoch}, Step {step})")
     plt.xlabel("Grid Width")
     plt.ylabel("Grid Height")
     plt.savefig(f"brain_scan_epoch{epoch}_step{step}.png")
     plt.close()
+
 
 def plot_feature_space(flattened_stats, assignments, step, epoch):
     """
@@ -23,7 +27,9 @@ def plot_feature_space(flattened_stats, assignments, step, epoch):
     For simplicity, let's assume we can plot the first two features directly.
     """
     if flattened_stats.shape[1] < 2:
-        print(f"Warning: Cannot plot feature space for {flattened_stats.shape[1]} features. Need at least 2.")
+        print(
+            f"Warning: Cannot plot feature space for {flattened_stats.shape[1]} features. Need at least 2."
+        )
         return
 
     plt.figure(figsize=(10, 8))
@@ -35,9 +41,9 @@ def plot_feature_space(flattened_stats, assignments, step, epoch):
         x=numpy_flattened_stats[:, 0],
         y=numpy_flattened_stats[:, 1],
         hue=numpy_assignments,
-        palette='tab10', # A good palette for categorical data
-        legend='full',
-        s=50 # Marker size
+        palette="tab10",  # A good palette for categorical data
+        legend="full",
+        s=50,  # Marker size
     )
     plt.title(f"Feature Space - Neuron Stats (Epoch {epoch}, Step {step})")
     plt.xlabel("Feature 1")

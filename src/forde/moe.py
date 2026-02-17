@@ -11,7 +11,7 @@ This module implements a standard MoE architecture with:
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from typing import Tuple, Optional
+from typing import Tuple
 
 
 class ExpertMLP(nn.Module):

@@ -385,7 +385,7 @@ if __name__ == "__main__":
     seq_len = 64
     input_ids = jax.random.randint(key, (batch_size, seq_len), 0, config.vocab_size)
 
-    print(f"\nConfiguration:")
+    print("\nConfiguration:")
     print(f"  - d_model: {config.d_model}")
     print(f"  - num_layers: {config.num_layers}")
     print(f"  - num_heads: {config.num_heads}")
@@ -397,7 +397,7 @@ if __name__ == "__main__":
     print(f"  - mHC: {config.use_hyper_connections} ({config.num_streams} streams)")
 
     # Initialize model
-    print(f"\nInitializing model...")
+    print("\nInitializing model...")
     model = FORDEDecoderLM(config=config)
     variables = model.init(key, input_ids)
 
@@ -406,7 +406,7 @@ if __name__ == "__main__":
     print(f"Total parameters: {param_count:,}")
 
     # Forward pass
-    print(f"\nRunning forward pass...")
+    print("\nRunning forward pass...")
     logits, aux_loss = model.apply(variables, input_ids)
 
     print(f"Input shape: {input_ids.shape}")
@@ -421,7 +421,7 @@ if __name__ == "__main__":
     print("\n✓ Forward pass successful!")
 
     # Test with loss computation
-    print(f"\nTesting loss computation...")
+    print("\nTesting loss computation...")
     labels = jax.random.randint(key, (batch_size, seq_len), 0, config.vocab_size)
 
     # Manual loss computation
@@ -435,7 +435,7 @@ if __name__ == "__main__":
     print(f"Total loss (LM + aux): {lm_loss + aux_loss:.4f}")
 
     # Test gradient computation
-    print(f"\nTesting gradient computation...")
+    print("\nTesting gradient computation...")
 
     def loss_fn(params, input_ids, labels):
         logits, aux_loss = model.apply({"params": params}, input_ids)

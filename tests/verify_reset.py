@@ -1,51 +1,77 @@
-
 import jax
 import jax.numpy as jnp
-from src.training.train import slow_loop_step
-from src.forde.model import VisionConfig, TextConfig
+from src.forde.moe_slow_loop import moe_slow_loop_step
+from src.forde.model import create_default_config
+
 
 def main():
-    print("Testing Stats Buffer Reset...")
-    
-    # Mock mutable variables
-    # Structure: stats_buffer -> data -> neuron_stats -> neuron_0 -> [stats]
-    #            stats_buffer -> data -> step_count
-    
-    features = 10
-    D = 5
-    
-    neuron_stats = {f'neuron_{i}': jnp.ones((D,), dtype=jnp.float32) for i in range(features)}
-    stats_buffer_data = {
-        'neuron_stats': neuron_stats,
-        'step_count': jnp.array(10, dtype=jnp.int32)
+    print("Testing MoE Slow Loop Stats Buffer Reset...")
+
+    # 1. Setup Mock Config
+    config = create_default_config()
+    config.num_layers = 1
+    config.num_experts = 4
+    config.d_model = 32
+
+    # 2. Setup Mock Model Params
+    model_params = {
+        "params": {
+            "layer_0": {
+                "moe": {"router_linear": {"bias": jnp.zeros(config.num_experts)}}
+            }
+        }
     }
-    
-    mutable_variables = {
-        'stats_buffer': {'data': stats_buffer_data},
-        'state': {'assignments': jnp.zeros((features,), dtype=jnp.int32)}
+
+    # 3. Setup Mock Mutable Variables (Stats Buffer)
+    stats_buffer = {
+        "layer_0": {
+            "moe": {
+                "expert_usage": jnp.ones(config.num_experts, dtype=jnp.float32),
+                "step_count": jnp.array(10, dtype=jnp.int32),
+            }
+        }
     }
-    
-    # Mock configs
-    vision_config = VisionConfig(16, 1, features, 1)
-    text_config = TextConfig(100, 1, features, 1, 16)
-    projection_dim = 2
-    key = jax.random.PRNGKey(0)
-    
-    # Run slow loop
-    updated_vars, _ = slow_loop_step(mutable_variables, vision_config, text_config, projection_dim, key, 0, 0)
-    
-    # Check if stats_buffer is reset
-    new_stats_buffer = updated_vars['stats_buffer']
-    new_step_count = new_stats_buffer['data']['step_count']
-    new_neuron_0_stats = new_stats_buffer['data']['neuron_stats']['neuron_0']
-    
-    print(f"New step count: {new_step_count}")
-    print(f"New neuron 0 stats: {new_neuron_0_stats}")
-    
-    if new_step_count == 0 and jnp.all(new_neuron_0_stats == 0):
+
+    mutable_variables = {"stats_buffer": stats_buffer}
+
+    print(f"Initial stats buffer: {mutable_variables}")
+
+    # 4. Run Slow Loop
+    key = jax.random.PRNGKey(42)
+    epoch = 0
+    step = 100
+
+    updated_params, updated_mutable, diagnostics = moe_slow_loop_step(
+        model_params=model_params,
+        mutable_variables=mutable_variables,
+        config=config,
+        key=key,
+        epoch=epoch,
+        step=step,
+    )
+
+    # 5. Verify Reset
+    print("\nVerifying reset...")
+
+    new_stats_buffer = updated_mutable["stats_buffer"]
+
+    # Just check that it's all zeros now
+    # The structure should be preserved but values reset
+
+    def check_zeros(x):
+        return jnp.all(x == 0)
+
+    # Fix: use jax.tree.map instead of deprecated jax.tree_map
+    all_zeros = jax.tree_util.tree_reduce(
+        lambda x, y: x and y, jax.tree.map(check_zeros, new_stats_buffer)
+    )
+
+    if all_zeros:
         print("SUCCESS: Stats buffer reset correctly.")
     else:
         print("FAILURE: Stats buffer NOT reset.")
+        print(f"New buffer: {new_stats_buffer}")
+
 
 if __name__ == "__main__":
     main()
