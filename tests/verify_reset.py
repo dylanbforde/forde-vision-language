@@ -61,7 +61,6 @@ def main():
     def check_zeros(x):
         return jnp.all(x == 0)
 
-    # Fix: use jax.tree.map instead of deprecated jax.tree_map
     all_zeros = jax.tree_util.tree_reduce(
         lambda x, y: x and y, jax.tree.map(check_zeros, new_stats_buffer)
     )
