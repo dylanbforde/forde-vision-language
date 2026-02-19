@@ -125,15 +125,8 @@ class MoELayer(nn.Module):
         Returns:
             (top_k_indices, top_k_probs) each of shape (batch, seq, top_k)
         """
-        # Get top-k indices
-        top_k_indices = jnp.argsort(router_logits, axis=-1)[..., -self.top_k :]
-
-        # Gather corresponding logits and convert to probs
-        # Create gather indices for advanced indexing
-        batch_size, seq_len, _ = router_logits.shape
-
-        # Gather top-k logits
-        top_k_logits = jnp.take_along_axis(router_logits, top_k_indices, axis=-1)
+        # Get top-k indices and values efficiently (O(N) vs O(N log N))
+        top_k_logits, top_k_indices = jax.lax.top_k(router_logits, self.top_k)
 
         # Normalize among selected experts (renormalize probabilities)
         top_k_probs = jax.nn.softmax(top_k_logits, axis=-1)
@@ -214,12 +207,16 @@ class MoELayer(nn.Module):
         num_tokens = batch_size * seq_len
 
         # Compute fraction of tokens routed to each expert
-        # One-hot encode selected experts
-        one_hot = jax.nn.one_hot(
-            top_k_indices, num_experts
-        )  # (batch, seq, top_k, num_experts)
-        # Sum over top_k and normalize across all tokens
-        fraction_per_expert = one_hot.sum(axis=(0, 1, 2)) / (num_tokens * self.top_k)
+        # Use bincount to avoid allocating large one-hot tensor
+        # Flatten indices to (batch * seq * top_k,)
+        flat_indices = top_k_indices.reshape(-1)
+        # Count occurrences of each expert index
+        expert_counts = jnp.bincount(
+            flat_indices, minlength=num_experts, length=num_experts
+        )
+        fraction_per_expert = expert_counts.astype(jnp.float32) / (
+            num_tokens * self.top_k
+        )
 
         # Compute mean probability assigned to each expert
         prob_per_expert = router_probs.mean(axis=(0, 1))
@@ -300,7 +297,7 @@ if __name__ == "__main__":
     moe = MoELayer(num_experts=4, top_k=2, expert_hidden_dim=512, d_model=d_model)
 
     variables = moe.init(key, x)
-    output, aux_loss = moe.apply(variables, x)
+    output, aux_loss, router_probs = moe.apply(variables, x)
 
     print(f"Input shape: {x.shape}")
     print(f"Output shape: {output.shape}")
