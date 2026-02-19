@@ -56,28 +56,39 @@ class SlidingWindowAttention(nn.Module):
     window_size: int = 512
 
     @nn.compact
-    def __call__(self, x, mask: Optional[jnp.ndarray] = None):
+    def __call__(
+        self,
+        x,
+        mask: Optional[jnp.ndarray] = None,
+        q: Optional[jnp.ndarray] = None,
+        k: Optional[jnp.ndarray] = None,
+        v: Optional[jnp.ndarray] = None,
+    ):
         """
         Compute sliding window attention.
 
         Args:
             x: Input tensor (batch, seq, d_model)
             mask: Optional additional attention mask
+            q: Optional pre-projected query (batch, heads, seq, head_dim)
+            k: Optional pre-projected key (batch, heads, seq, head_dim)
+            v: Optional pre-projected value (batch, heads, seq, head_dim)
 
         Returns:
             Output tensor (batch, seq, d_model)
         """
         batch_size, seq_len, d_model = x.shape
 
-        # Project to Q, K, V
-        qkv = nn.Dense(3 * self.num_heads * self.head_dim, name="qkv_proj")(x)
-        qkv = qkv.reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+        if q is None or k is None or v is None:
+            # Project to Q, K, V
+            qkv = nn.Dense(3 * self.num_heads * self.head_dim, name="qkv_proj")(x)
+            qkv = qkv.reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
+            q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
 
-        # Transpose for attention: (batch, heads, seq, head_dim)
-        q = q.transpose(0, 2, 1, 3)
-        k = k.transpose(0, 2, 1, 3)
-        v = v.transpose(0, 2, 1, 3)
+            # Transpose for attention: (batch, heads, seq, head_dim)
+            q = q.transpose(0, 2, 1, 3)
+            k = k.transpose(0, 2, 1, 3)
+            v = v.transpose(0, 2, 1, 3)
 
         # Compute attention scores
         scale = 1.0 / jnp.sqrt(self.head_dim)
@@ -117,13 +128,19 @@ class CompressedGlobalAttention(nn.Module):
     compression_ratio: int = 8  # Pool this many tokens into one
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray, local_window_start: int) -> jnp.ndarray:
+    def __call__(
+        self,
+        x: jnp.ndarray,
+        local_window_start: int,
+        q: Optional[jnp.ndarray] = None,
+    ) -> jnp.ndarray:
         """
         Compute attention to compressed global context.
 
         Args:
             x: Input tensor (batch, seq, d_model)
             local_window_start: Start position of local window (compress tokens before this)
+            q: Optional pre-projected query (batch, heads, seq, head_dim)
 
         Returns:
             Output contribution from global context (batch, seq, d_model)
@@ -154,10 +171,11 @@ class CompressedGlobalAttention(nn.Module):
         )
         compressed = pooled.mean(axis=2)  # (batch, num_pools, d_model)
 
-        # Project current tokens to queries
-        q = nn.Dense(self.num_heads * self.head_dim, name="q_proj")(x)
-        q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        q = q.transpose(0, 2, 1, 3)  # (batch, heads, seq, head_dim)
+        # Project current tokens to queries if not provided
+        if q is None:
+            q = nn.Dense(self.num_heads * self.head_dim, name="q_proj")(x)
+            q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+            q = q.transpose(0, 2, 1, 3)  # (batch, heads, seq, head_dim)
 
         # Project compressed tokens to keys and values
         k = nn.Dense(self.num_heads * self.head_dim, name="k_proj")(compressed)
@@ -205,7 +223,10 @@ class TopKSelection(nn.Module):
 
     @nn.compact
     def __call__(
-        self, x: jnp.ndarray, importance_scores: Optional[jnp.ndarray] = None
+        self,
+        x: jnp.ndarray,
+        importance_scores: Optional[jnp.ndarray] = None,
+        q: Optional[jnp.ndarray] = None,
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """
         Select and attend to top-k important tokens.
@@ -213,6 +234,7 @@ class TopKSelection(nn.Module):
         Args:
             x: Input tensor (batch, seq, d_model)
             importance_scores: Optional pre-computed scores (batch, seq)
+            q: Optional pre-projected query (batch, heads, seq, head_dim)
 
         Returns:
             Tuple of (output, selected_indices)
@@ -239,10 +261,11 @@ class TopKSelection(nn.Module):
         batch_indices = jnp.arange(batch_size)[:, None]
         selected_tokens = x[batch_indices, top_k_indices, :]  # (batch, k, d_model)
 
-        # Project to Q, K, V
-        q = nn.Dense(self.num_heads * self.head_dim, name="q_proj")(x)
-        q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        q = q.transpose(0, 2, 1, 3)
+        # Project to Q if not provided
+        if q is None:
+            q = nn.Dense(self.num_heads * self.head_dim, name="q_proj")(x)
+            q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+            q = q.transpose(0, 2, 1, 3)
 
         k_proj = nn.Dense(self.num_heads * self.head_dim, name="k_proj")(
             selected_tokens
@@ -314,13 +337,24 @@ class NativeSparseAttention(nn.Module):
         """
         batch_size, seq_len, d_model = x.shape
 
+        # Shared projection for Q (used by all) and local K, V
+        # This saves compute by projecting x to Q once instead of thrice
+        qkv = nn.Dense(3 * self.num_heads * self.head_dim, name="qkv_proj")(x)
+        qkv = qkv.reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
+        q, k_local, v_local = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+
+        # Transpose for attention: (batch, heads, seq, head_dim)
+        q = q.transpose(0, 2, 1, 3)
+        k_local = k_local.transpose(0, 2, 1, 3)
+        v_local = v_local.transpose(0, 2, 1, 3)
+
         # 1. Local sliding window attention (always computed)
         local_attn = SlidingWindowAttention(
             num_heads=self.num_heads,
             head_dim=self.head_dim,
             window_size=self.window_size,
             name="local_attention",
-        )(x, mask)
+        )(x, mask, q=q, k=k_local, v=v_local)
 
         # Initialize output as local attention
         output = local_attn
@@ -339,7 +373,9 @@ class NativeSparseAttention(nn.Module):
                 local_window_start, self.compression_ratio + 1
             )
 
-            compressed_attn = self._compressed_global_attention(x, effective_start)
+            compressed_attn = self._compressed_global_attention(
+                x, effective_start, q=q
+            )
 
             # Learned gate for combining
             gate_compressed = nn.Dense(d_model, name="gate_compressed")(x)
@@ -351,7 +387,7 @@ class NativeSparseAttention(nn.Module):
 
         # 3. Top-k selection (fine-grained)
         if self.use_top_k:
-            top_k_attn = self._top_k_attention(x)
+            top_k_attn = self._top_k_attention(x, q=q)
 
             # Learned gate for combining
             gate_top_k = nn.Dense(d_model, name="gate_top_k")(x)
@@ -364,7 +400,10 @@ class NativeSparseAttention(nn.Module):
         return output
 
     def _compressed_global_attention(
-        self, x: jnp.ndarray, local_window_start: int
+        self,
+        x: jnp.ndarray,
+        local_window_start: int,
+        q: Optional[jnp.ndarray] = None,
     ) -> jnp.ndarray:
         """Compute compressed global attention with guaranteed parameter initialization.
 
@@ -391,10 +430,11 @@ class NativeSparseAttention(nn.Module):
         )
         compressed = pooled.mean(axis=2)  # (batch, num_pools, d_model)
 
-        # Project to Q, K, V
-        q = nn.Dense(self.num_heads * self.head_dim, name="compressed_q_proj")(x)
-        q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        q = q.transpose(0, 2, 1, 3)
+        # Project to Q if not provided
+        if q is None:
+            q = nn.Dense(self.num_heads * self.head_dim, name="compressed_q_proj")(x)
+            q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+            q = q.transpose(0, 2, 1, 3)
 
         k = nn.Dense(self.num_heads * self.head_dim, name="compressed_k_proj")(
             compressed
@@ -427,7 +467,9 @@ class NativeSparseAttention(nn.Module):
 
         return output
 
-    def _top_k_attention(self, x: jnp.ndarray) -> jnp.ndarray:
+    def _top_k_attention(
+        self, x: jnp.ndarray, q: Optional[jnp.ndarray] = None
+    ) -> jnp.ndarray:
         """Compute top-k selection attention with guaranteed parameter initialization."""
         batch_size, seq_len, d_model = x.shape
         k = min(self.top_k_global, seq_len)
@@ -442,10 +484,11 @@ class NativeSparseAttention(nn.Module):
         batch_indices = jnp.arange(batch_size)[:, None]
         selected_tokens = x[batch_indices, top_k_indices, :]
 
-        # Project to Q, K, V
-        q = nn.Dense(self.num_heads * self.head_dim, name="topk_q_proj")(x)
-        q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        q = q.transpose(0, 2, 1, 3)
+        # Project to Q if not provided
+        if q is None:
+            q = nn.Dense(self.num_heads * self.head_dim, name="topk_q_proj")(x)
+            q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+            q = q.transpose(0, 2, 1, 3)
 
         k_proj = nn.Dense(self.num_heads * self.head_dim, name="topk_k_proj")(
             selected_tokens
