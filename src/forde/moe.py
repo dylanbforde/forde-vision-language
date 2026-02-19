@@ -125,15 +125,8 @@ class MoELayer(nn.Module):
         Returns:
             (top_k_indices, top_k_probs) each of shape (batch, seq, top_k)
         """
-        # Get top-k indices
-        top_k_indices = jnp.argsort(router_logits, axis=-1)[..., -self.top_k :]
-
-        # Gather corresponding logits and convert to probs
-        # Create gather indices for advanced indexing
-        batch_size, seq_len, _ = router_logits.shape
-
-        # Gather top-k logits
-        top_k_logits = jnp.take_along_axis(router_logits, top_k_indices, axis=-1)
+        # Get top-k indices and logits efficiently
+        top_k_logits, top_k_indices = jax.lax.top_k(router_logits, self.top_k)
 
         # Normalize among selected experts (renormalize probabilities)
         top_k_probs = jax.nn.softmax(top_k_logits, axis=-1)
