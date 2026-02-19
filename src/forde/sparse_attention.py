@@ -233,7 +233,7 @@ class TopKSelection(nn.Module):
 
         # Expand scores for each query position with causal masking
         # For simplicity, we use global top-k selection per batch
-        top_k_indices = jnp.argsort(importance_scores, axis=-1)[:, -k:]  # (batch, k)
+        _, top_k_indices = jax.lax.top_k(importance_scores, k)  # (batch, k)
 
         # Gather selected tokens
         batch_indices = jnp.arange(batch_size)[:, None]
@@ -436,7 +436,7 @@ class NativeSparseAttention(nn.Module):
         importance_scores = nn.Dense(1, name="importance_scorer")(x).squeeze(-1)
 
         # Top-k selection
-        top_k_indices = jnp.argsort(importance_scores, axis=-1)[:, -k:]
+        _, top_k_indices = jax.lax.top_k(importance_scores, k)
 
         # Gather selected tokens
         batch_indices = jnp.arange(batch_size)[:, None]
