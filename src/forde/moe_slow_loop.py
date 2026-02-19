@@ -20,7 +20,7 @@ types while others remain generalists.
 import jax
 import jax.numpy as jnp
 from flax.core import unfreeze
-from typing import Dict, Tuple, Optional, Any
+from typing import Dict, Tuple, Any
 
 # Handle imports
 try:
@@ -31,15 +31,12 @@ except ModuleNotFoundError:
     from clustering import cluster_neurons_gmm
 
 
-def calculate_expert_stats(
-    router_probs: jnp.ndarray, expert_outputs: Optional[jnp.ndarray] = None
-) -> jnp.ndarray:
+def calculate_expert_stats(router_probs: jnp.ndarray) -> jnp.ndarray:
     """
     Calculate statistics for each expert based on routing patterns.
 
     Args:
         router_probs: (batch, seq, num_experts) - Router probability distribution
-        expert_outputs: Optional (num_experts, batch, seq, d_model) - Expert outputs
 
     Returns:
         (num_experts, D) array of expert statistics
