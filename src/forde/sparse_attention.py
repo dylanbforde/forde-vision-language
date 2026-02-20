@@ -436,7 +436,8 @@ class NativeSparseAttention(nn.Module):
         importance_scores = nn.Dense(1, name="importance_scorer")(x).squeeze(-1)
 
         # Top-k selection
-        top_k_indices = jnp.argsort(importance_scores, axis=-1)[:, -k:]
+        # Use jax.lax.top_k for O(N) complexity instead of O(N log N) argsort
+        _, top_k_indices = jax.lax.top_k(importance_scores, k)
 
         # Gather selected tokens
         batch_indices = jnp.arange(batch_size)[:, None]
