@@ -407,7 +407,8 @@ if __name__ == "__main__":
 
     # Forward pass
     print("\nRunning forward pass...")
-    logits, aux_loss = model.apply(variables, input_ids)
+    # Fix: stats_buffer is mutable
+    (logits, aux_loss), updated_vars = model.apply(variables, input_ids, mutable=["stats_buffer"])
 
     print(f"Input shape: {input_ids.shape}")
     print(f"Output logits shape: {logits.shape}")
@@ -438,7 +439,11 @@ if __name__ == "__main__":
     print("\nTesting gradient computation...")
 
     def loss_fn(params, input_ids, labels):
-        logits, aux_loss = model.apply({"params": params}, input_ids)
+        (logits, aux_loss), _ = model.apply(
+            {"params": params, "stats_buffer": variables["stats_buffer"]},
+            input_ids,
+            mutable=["stats_buffer"]
+        )
         shift_logits = logits[:, :-1, :]
         shift_labels = labels[:, 1:]
         lm_loss = optax.softmax_cross_entropy_with_integer_labels(

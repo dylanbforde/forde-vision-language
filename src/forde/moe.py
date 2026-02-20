@@ -126,7 +126,8 @@ class MoELayer(nn.Module):
             (top_k_indices, top_k_probs) each of shape (batch, seq, top_k)
         """
         # Get top-k indices
-        top_k_indices = jnp.argsort(router_logits, axis=-1)[..., -self.top_k :]
+        # Optimization: Use top_k for faster selection, especially with many experts
+        _, top_k_indices = jax.lax.top_k(router_logits, self.top_k)
 
         # Gather corresponding logits and convert to probs
         # Create gather indices for advanced indexing
@@ -300,7 +301,7 @@ if __name__ == "__main__":
     moe = MoELayer(num_experts=4, top_k=2, expert_hidden_dim=512, d_model=d_model)
 
     variables = moe.init(key, x)
-    output, aux_loss = moe.apply(variables, x)
+    output, aux_loss, router_probs = moe.apply(variables, x)
 
     print(f"Input shape: {x.shape}")
     print(f"Output shape: {output.shape}")
