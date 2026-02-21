@@ -126,7 +126,8 @@ class MoELayer(nn.Module):
             (top_k_indices, top_k_probs) each of shape (batch, seq, top_k)
         """
         # Get top-k indices
-        top_k_indices = jnp.argsort(router_logits, axis=-1)[..., -self.top_k :]
+        # Use top_k instead of argsort for better performance (O(N) vs O(N log N))
+        _, top_k_indices = jax.lax.top_k(router_logits, self.top_k)
 
         # Gather corresponding logits and convert to probs
         # Create gather indices for advanced indexing
