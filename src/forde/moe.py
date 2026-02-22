@@ -125,15 +125,10 @@ class MoELayer(nn.Module):
         Returns:
             (top_k_indices, top_k_probs) each of shape (batch, seq, top_k)
         """
-        # Get top-k indices
-        top_k_indices = jnp.argsort(router_logits, axis=-1)[..., -self.top_k :]
-
-        # Gather corresponding logits and convert to probs
-        # Create gather indices for advanced indexing
-        batch_size, seq_len, _ = router_logits.shape
-
-        # Gather top-k logits
-        top_k_logits = jnp.take_along_axis(router_logits, top_k_indices, axis=-1)
+        # Use jax.lax.top_k for more efficient top-k selection (typically O(N) vs O(N log N))
+        # Note: returns values in descending order (best first), whereas argsort was ascending.
+        # This order change is handled correctly by downstream sum operations.
+        top_k_logits, top_k_indices = jax.lax.top_k(router_logits, k=self.top_k)
 
         # Normalize among selected experts (renormalize probabilities)
         top_k_probs = jax.nn.softmax(top_k_logits, axis=-1)
@@ -214,12 +209,14 @@ class MoELayer(nn.Module):
         num_tokens = batch_size * seq_len
 
         # Compute fraction of tokens routed to each expert
-        # One-hot encode selected experts
-        one_hot = jax.nn.one_hot(
-            top_k_indices, num_experts
-        )  # (batch, seq, top_k, num_experts)
-        # Sum over top_k and normalize across all tokens
-        fraction_per_expert = one_hot.sum(axis=(0, 1, 2)) / (num_tokens * self.top_k)
+        # Flatten indices to count occurrences
+        flat_indices = top_k_indices.reshape(-1)
+
+        # Use bincount instead of one_hot + sum for memory efficiency
+        # Avoids allocating (batch, seq, top_k, num_experts) tensor
+        expert_counts = jnp.bincount(flat_indices, length=num_experts)
+
+        fraction_per_expert = expert_counts / (num_tokens * self.top_k)
 
         # Compute mean probability assigned to each expert
         prob_per_expert = router_probs.mean(axis=(0, 1))
