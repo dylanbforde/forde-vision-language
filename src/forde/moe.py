@@ -297,11 +297,13 @@ if __name__ == "__main__":
     moe = MoELayer(num_experts=4, top_k=2, expert_hidden_dim=512, d_model=d_model)
 
     variables = moe.init(key, x)
-    output, aux_loss = moe.apply(variables, x)
+    # Update: MoELayer returns 3 values: output, aux_loss, router_probs
+    output, aux_loss, router_probs = moe.apply(variables, x)
 
     print(f"Input shape: {x.shape}")
     print(f"Output shape: {output.shape}")
     print(f"Aux loss: {aux_loss}")
+    print(f"Router probs shape: {router_probs.shape}")
     print(f"Output matches input shape: {output.shape == x.shape}")
 
     # Verify outputs are not all zeros
