@@ -380,11 +380,16 @@ class NativeSparseAttention(nn.Module):
         truncated_len = num_pools * self.compression_ratio
 
         # Create indices for pooling (use modular access for safety)
-        pool_indices = jnp.arange(truncated_len) % seq_len
-        batch_idx = jnp.arange(batch_size)[:, None]
-        global_tokens = x[
-            batch_idx, pool_indices[None, :], :
-        ]  # (batch, truncated_len, d_model)
+        # Bolt Optimization: Use slicing for contiguous memory access when possible
+        if truncated_len <= seq_len:
+            global_tokens = x[:, :truncated_len, :]  # (batch, truncated_len, d_model)
+        else:
+            # Fallback for very short sequences where truncated_len > seq_len
+            pool_indices = jnp.arange(truncated_len) % seq_len
+            batch_idx = jnp.arange(batch_size)[:, None]
+            global_tokens = x[
+                batch_idx, pool_indices[None, :], :
+            ]  # (batch, truncated_len, d_model)
 
         # Reshape and pool
         pooled = global_tokens.reshape(
