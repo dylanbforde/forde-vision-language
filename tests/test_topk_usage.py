@@ -35,7 +35,7 @@ def test_topk_usage():
     # 2. Test NativeSparseAttention
     print("Testing NativeSparseAttention...")
     layer = NativeSparseAttention(
-        num_heads=2, head_dim=32,
+        num_heads=2, head_dim=32, d_model=d_model,
         window_size=32, compression_ratio=4, top_k_global=k,
         use_compressed=False, use_top_k=True
     )

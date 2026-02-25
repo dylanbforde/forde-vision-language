@@ -76,6 +76,7 @@ def test_sparse_attention_shapes():
     attn = NativeSparseAttention(
         num_heads=4,
         head_dim=16,
+        d_model=d_model,
         window_size=32,
         compression_ratio=4,
         top_k_global=16
