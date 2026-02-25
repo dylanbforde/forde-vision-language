@@ -127,6 +127,7 @@ class DecoderBlock(nn.Module):
             attn_output = NativeSparseAttention(
                 num_heads=config.num_heads,
                 head_dim=config.head_dim,
+                d_model=config.d_model,
                 window_size=config.window_size,
                 compression_ratio=config.compression_ratio,
                 top_k_global=config.top_k_global,

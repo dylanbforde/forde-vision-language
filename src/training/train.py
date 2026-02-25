@@ -60,8 +60,8 @@ def create_train_state(
     """Create training state with model and optimizer."""
     model = FORDEDecoderLM(config=config)
 
-    # Initialize with dummy input
-    dummy_input = jnp.ones((1, 64), dtype=jnp.int32)
+    # Initialize with dummy input using max_seq_len to ensure all parameters are created
+    dummy_input = jnp.ones((1, config.max_seq_len), dtype=jnp.int32)
     variables = model.init(key, dummy_input)
     params = variables["params"]
 

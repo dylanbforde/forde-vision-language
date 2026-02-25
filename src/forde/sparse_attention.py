@@ -53,6 +53,7 @@ class SlidingWindowAttention(nn.Module):
 
     num_heads: int
     head_dim: int
+    d_model: int  # Added d_model
     window_size: int = 512
 
     @nn.compact
@@ -99,7 +100,7 @@ class SlidingWindowAttention(nn.Module):
         output = output.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
 
         # Output projection
-        output = nn.Dense(d_model, name="out_proj")(output)
+        output = nn.Dense(self.d_model, name="out_proj")(output)
 
         return output
 
@@ -287,19 +288,48 @@ class NativeSparseAttention(nn.Module):
 
     The outputs are combined with learned gating weights.
 
-    Note: All modules are always initialized (for JIT compatibility).
-    Conditional execution is handled via gating/masking.
+    IMPORTANT: To ensure all parameters are created correctly, the model MUST be
+    initialized with a sequence length large enough to trigger global attention
+    (i.e., seq_len > window_size + compression_ratio).
+    Ideally, initialize with config.max_seq_len.
     """
 
-    num_heads: int = 8
-    head_dim: int = 64
+    num_heads: int
+    head_dim: int
+    d_model: int  # Added d_model requirement
     window_size: int = 512  # Local sliding window size
     compression_ratio: int = 8  # Compression for global context
     top_k_global: int = 64  # Number of important tokens to select
     use_compressed: bool = True  # Enable compressed global attention
     use_top_k: bool = True  # Enable top-k selection
 
-    @nn.compact
+    def setup(self):
+        # 1. Local sliding window attention
+        self.local_attn = SlidingWindowAttention(
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            d_model=self.d_model,
+            window_size=self.window_size,
+            name="local_attention",
+        )
+
+        # 2. Compressed global attention layers
+        if self.use_compressed:
+            self.compressed_q_proj = nn.Dense(self.num_heads * self.head_dim, name="compressed_q_proj")
+            self.compressed_k_proj = nn.Dense(self.num_heads * self.head_dim, name="compressed_k_proj")
+            self.compressed_v_proj = nn.Dense(self.num_heads * self.head_dim, name="compressed_v_proj")
+            self.compressed_out_proj = nn.Dense(self.d_model, name="compressed_out_proj")
+            self.gate_compressed = nn.Dense(self.d_model, name="gate_compressed")
+
+        # 3. Top-k selection layers
+        if self.use_top_k:
+            self.importance_scorer = nn.Dense(1, name="importance_scorer")
+            self.topk_q_proj = nn.Dense(self.num_heads * self.head_dim, name="topk_q_proj")
+            self.topk_k_proj = nn.Dense(self.num_heads * self.head_dim, name="topk_k_proj")
+            self.topk_v_proj = nn.Dense(self.num_heads * self.head_dim, name="topk_v_proj")
+            self.topk_out_proj = nn.Dense(self.d_model, name="topk_out_proj")
+            self.gate_top_k = nn.Dense(self.d_model, name="gate_top_k")
+
     def __call__(
         self, x: jnp.ndarray, mask: Optional[jnp.ndarray] = None
     ) -> jnp.ndarray:
@@ -316,26 +346,14 @@ class NativeSparseAttention(nn.Module):
         batch_size, seq_len, d_model = x.shape
 
         # 1. Local sliding window attention (always computed)
-        local_attn = SlidingWindowAttention(
-            num_heads=self.num_heads,
-            head_dim=self.head_dim,
-            window_size=self.window_size,
-            name="local_attention",
-        )(x, mask)
-
-        # Initialize output as local attention
-        output = local_attn
+        output = self.local_attn(x, mask)
 
         # Compute whether we should use global attention
-        # This is a static shape check that determines if global context exists
         local_window_start = seq_len - self.window_size
         has_global_context = local_window_start > self.compression_ratio
 
         # 2. Compressed global attention (coarse-grained)
-        # Always compute but gate to zero if not applicable
-        if self.use_compressed:
-            # Always run the attention for JIT tracing consistency
-            # Use the full sequence if no global context, but gate it out
+        if self.use_compressed and has_global_context:
             effective_start = jnp.maximum(
                 local_window_start, self.compression_ratio + 1
             )
@@ -343,43 +361,38 @@ class NativeSparseAttention(nn.Module):
             compressed_attn = self._compressed_global_attention(x, effective_start)
 
             # Learned gate for combining
-            gate_compressed = nn.Dense(d_model, name="gate_compressed")(x)
-            gate_compressed = jax.nn.sigmoid(gate_compressed)
+            gate = self.gate_compressed(x)
+            gate = jax.nn.sigmoid(gate)
 
-            # Zero out contribution if no global context
-            use_compressed_mask = jnp.where(has_global_context, 1.0, 0.0)
-            output = output + use_compressed_mask * gate_compressed * compressed_attn
+            output = output + gate * compressed_attn
 
         # 3. Top-k selection (fine-grained)
-        if self.use_top_k:
+        # Condition: sequence length > window size
+        has_top_k_context = seq_len > self.window_size
+
+        if self.use_top_k and has_top_k_context:
             top_k_attn = self._top_k_attention(x)
 
             # Learned gate for combining
-            gate_top_k = nn.Dense(d_model, name="gate_top_k")(x)
-            gate_top_k = jax.nn.sigmoid(gate_top_k)
+            gate = self.gate_top_k(x)
+            gate = jax.nn.sigmoid(gate)
 
-            # Zero out if sequence is too short
-            use_top_k_mask = jnp.where(seq_len > self.window_size, 1.0, 0.0)
-            output = output + use_top_k_mask * gate_top_k * top_k_attn
+            output = output + gate * top_k_attn
 
         return output
 
     def _compressed_global_attention(
         self, x: jnp.ndarray, local_window_start: int
     ) -> jnp.ndarray:
-        """Compute compressed global attention with guaranteed parameter initialization.
-
-        Uses static shapes based on seq_len (known at trace time) for JIT compatibility.
-        """
+        """Compute compressed global attention using pre-defined layers."""
         batch_size, seq_len, d_model = x.shape
 
         # Compute static number of pools based on sequence length
-        # This gives us the maximum possible pools based on window_size
         max_global_len = max(seq_len - self.window_size, self.compression_ratio)
         num_pools = max(max_global_len // self.compression_ratio, 1)
         truncated_len = num_pools * self.compression_ratio
 
-        # Create indices for pooling (use modular access for safety)
+        # Create indices for pooling
         pool_indices = jnp.arange(truncated_len) % seq_len
         batch_idx = jnp.arange(batch_size)[:, None]
         global_tokens = x[
@@ -393,19 +406,15 @@ class NativeSparseAttention(nn.Module):
         compressed = pooled.mean(axis=2)  # (batch, num_pools, d_model)
 
         # Project to Q, K, V
-        q = nn.Dense(self.num_heads * self.head_dim, name="compressed_q_proj")(x)
+        q = self.compressed_q_proj(x)
         q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
         q = q.transpose(0, 2, 1, 3)
 
-        k = nn.Dense(self.num_heads * self.head_dim, name="compressed_k_proj")(
-            compressed
-        )
+        k = self.compressed_k_proj(compressed)
         k = k.reshape(batch_size, num_pools, self.num_heads, self.head_dim)
         k = k.transpose(0, 2, 1, 3)
 
-        v = nn.Dense(self.num_heads * self.head_dim, name="compressed_v_proj")(
-            compressed
-        )
+        v = self.compressed_v_proj(compressed)
         v = v.reshape(batch_size, num_pools, self.num_heads, self.head_dim)
         v = v.transpose(0, 2, 1, 3)
 
@@ -424,20 +433,19 @@ class NativeSparseAttention(nn.Module):
         output = jnp.einsum("bhqk,bhkd->bhqd", attn_weights, v)
 
         output = output.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
-        output = nn.Dense(d_model, name="compressed_out_proj")(output)
+        output = self.compressed_out_proj(output)
 
         return output
 
     def _top_k_attention(self, x: jnp.ndarray) -> jnp.ndarray:
-        """Compute top-k selection attention with guaranteed parameter initialization."""
+        """Compute top-k selection attention using pre-defined layers."""
         batch_size, seq_len, d_model = x.shape
         k = min(self.top_k_global, seq_len)
 
         # Importance scoring
-        importance_scores = nn.Dense(1, name="importance_scorer")(x).squeeze(-1)
+        importance_scores = self.importance_scorer(x).squeeze(-1)
 
         # Top-k selection
-        # Bolt Optimization: Use lax.top_k instead of argsort for faster selection
         _, top_k_indices = jax.lax.top_k(importance_scores, k)
 
         # Gather selected tokens
@@ -445,19 +453,15 @@ class NativeSparseAttention(nn.Module):
         selected_tokens = x[batch_indices, top_k_indices, :]
 
         # Project to Q, K, V
-        q = nn.Dense(self.num_heads * self.head_dim, name="topk_q_proj")(x)
+        q = self.topk_q_proj(x)
         q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
         q = q.transpose(0, 2, 1, 3)
 
-        k_proj = nn.Dense(self.num_heads * self.head_dim, name="topk_k_proj")(
-            selected_tokens
-        )
+        k_proj = self.topk_k_proj(selected_tokens)
         k_proj = k_proj.reshape(batch_size, k, self.num_heads, self.head_dim)
         k_proj = k_proj.transpose(0, 2, 1, 3)
 
-        v_proj = nn.Dense(self.num_heads * self.head_dim, name="topk_v_proj")(
-            selected_tokens
-        )
+        v_proj = self.topk_v_proj(selected_tokens)
         v_proj = v_proj.reshape(batch_size, k, self.num_heads, self.head_dim)
         v_proj = v_proj.transpose(0, 2, 1, 3)
 
@@ -475,7 +479,7 @@ class NativeSparseAttention(nn.Module):
         output = jnp.einsum("bhqk,bhkd->bhqd", attn_weights, v_proj)
 
         output = output.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
-        output = nn.Dense(d_model, name="topk_out_proj")(output)
+        output = self.topk_out_proj(output)
 
         return output
 
@@ -530,6 +534,7 @@ if __name__ == "__main__":
     sparse_attn = NativeSparseAttention(
         num_heads=num_heads,
         head_dim=head_dim,
+        d_model=d_model, # Added d_model
         window_size=32,  # Small window for testing
         compression_ratio=4,
         top_k_global=16,
