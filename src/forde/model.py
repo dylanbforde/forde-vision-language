@@ -27,13 +27,22 @@ try:
         StreamCollapser,
     )
 except ModuleNotFoundError:
-    from moe import MoELayer, MoEStatefulLayer
-    from sparse_attention import NativeSparseAttention, CausalSelfAttention
-    from hyper_connections import (
-        HyperConnectionStream,
-        ManifoldHyperConnection,
-        StreamCollapser,
-    )
+    try:
+        from forde.moe import MoELayer, MoEStatefulLayer
+        from forde.sparse_attention import NativeSparseAttention, CausalSelfAttention
+        from forde.hyper_connections import (
+            HyperConnectionStream,
+            ManifoldHyperConnection,
+            StreamCollapser,
+        )
+    except ModuleNotFoundError:
+        from moe import MoELayer, MoEStatefulLayer
+        from sparse_attention import NativeSparseAttention, CausalSelfAttention
+        from hyper_connections import (
+            HyperConnectionStream,
+            ManifoldHyperConnection,
+            StreamCollapser,
+        )
 
 
 @dataclass
