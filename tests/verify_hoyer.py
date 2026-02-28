@@ -1,5 +1,4 @@
 
-import jax
 import jax.numpy as jnp
 from src.forde.sensing import hoyer_sparsity
 
@@ -30,7 +29,6 @@ def main():
     # This is > 1. This is technically incorrect/undefined.
     # Ideally it should probably be 0 (undefined sparsity usually treated as 0 or NaN).
     
-    n = 10
     expected_zero_result = 0.0
     print(f"Expected result for zero vector with fixed logic: {expected_zero_result}")
     

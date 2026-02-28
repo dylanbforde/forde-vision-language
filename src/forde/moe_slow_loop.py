@@ -24,10 +24,9 @@ from typing import Dict, Tuple, Optional, Any
 
 # Handle imports
 try:
-    from src.forde.sensing import calculate_neuron_stats, hoyer_sparsity
+
     from src.forde.clustering import cluster_neurons_gmm
 except ModuleNotFoundError:
-    from sensing import calculate_neuron_stats, hoyer_sparsity
     from clustering import cluster_neurons_gmm
 
 
