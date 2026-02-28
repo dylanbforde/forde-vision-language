@@ -2,8 +2,6 @@ import jax
 import jax.numpy as jnp
 import sys
 import os
-import pytest
-from flax import linen as nn
 
 # Add src to path
 sys.path.append(os.path.join(os.path.dirname(__file__), "../src"))
@@ -40,7 +38,7 @@ def test_moe_layer_shapes():
 def test_moe_top_k_consistency():
     # Verify that top-k selection logic works as expected (descending order)
     # This indirectly tests our argsort -> top_k replacement
-    key = jax.random.PRNGKey(101)
+    jax.random.PRNGKey(101)
 
     # Create dummy logits
     logits = jnp.array([

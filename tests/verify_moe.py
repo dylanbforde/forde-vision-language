@@ -1,8 +1,6 @@
 
 import jax
 import jax.numpy as jnp
-import pytest
-from flax import linen as nn
 import sys
 import os
 
