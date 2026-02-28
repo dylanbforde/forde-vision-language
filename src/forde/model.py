@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 # Handle imports for both package and script execution
 try:
-    from src.forde.moe import MoELayer, MoEStatefulLayer
+    from src.forde.moe import MoEStatefulLayer
     from src.forde.sparse_attention import NativeSparseAttention, CausalSelfAttention
     from src.forde.hyper_connections import (
         HyperConnectionStream,
@@ -27,7 +27,7 @@ try:
         StreamCollapser,
     )
 except ModuleNotFoundError:
-    from moe import MoELayer, MoEStatefulLayer
+    from moe import MoEStatefulLayer
     from sparse_attention import NativeSparseAttention, CausalSelfAttention
     from hyper_connections import (
         HyperConnectionStream,
