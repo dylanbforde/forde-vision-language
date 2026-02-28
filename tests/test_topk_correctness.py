@@ -1,7 +1,6 @@
 
 import jax
 import jax.numpy as jnp
-import pytest
 
 def test_top_k_equivalence():
     key = jax.random.PRNGKey(42)

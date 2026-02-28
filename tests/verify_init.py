@@ -1,5 +1,4 @@
 import jax
-import jax.numpy as jnp
 from src.forde.model import FORDEDecoderLM, create_default_config
 
 

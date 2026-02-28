@@ -2,7 +2,6 @@
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-import optax
 
 class TestModel(nn.Module):
     @nn.compact
