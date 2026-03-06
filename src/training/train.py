@@ -165,7 +165,7 @@ def train_step(state, batch, vocab_size, aux_loss_weight):
     state = state.replace(stats_buffer=new_mutable_vars["stats_buffer"])
 
     # Compute gradient norm for monitoring
-    grad_norm = jnp.sqrt(sum(jnp.sum(x**2) for x in jax.tree.leaves(grads)))
+    grad_norm = optax.global_norm(grads)  # Bolt Optimization: Avoid manual Python loop for faster compilation
     metrics["grad_norm"] = grad_norm
 
     return state, metrics
