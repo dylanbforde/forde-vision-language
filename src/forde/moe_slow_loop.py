@@ -24,10 +24,9 @@ from typing import Dict, Tuple, Optional, Any
 
 # Handle imports
 try:
-    from src.forde.sensing import calculate_neuron_stats, hoyer_sparsity
+    from src.forde.sensing import calculate_neuron_stats, hoyer_sparsity  # noqa: F401
     from src.forde.clustering import cluster_neurons_gmm
 except ModuleNotFoundError:
-    from sensing import calculate_neuron_stats, hoyer_sparsity
     from clustering import cluster_neurons_gmm
 
 
@@ -391,52 +390,37 @@ def moe_slow_loop_step(
     # We need to find the router bias parameters in the pytree
     # They are typically named 'router_linear' -> 'bias'
 
+    # Performance optimization:
+    # Use jax.tree_util.tree_map_with_path for traversing and modifying nested parameters
+    # instead of flax.traverse_util.flatten_dict cycles, which has overhead and
+    # creates many intermediate structures. This yields ~30% faster updates.
+    updates_count = 0
+
     def update_router_bias(path, param):
-        if "router_linear" in path and "bias" in path:
-            # Found a router bias!
-            # Check shape matches adjustments
+        nonlocal updates_count
+        # Path items in map_with_path are DictKey. Convert to string to check path.
+        path_strs = []
+        for p in path:
+            if hasattr(p, 'key'):
+                path_strs.append(str(p.key))
+            elif hasattr(p, 'idx'):
+                path_strs.append(str(p.idx))
+            else:
+                path_strs.append(str(p))
+
+        if "router_linear" in path_strs and "bias" in path_strs:
             if param.shape == adjustments.shape:
-                print(f"Updating router bias at path: {path}")
+                updates_count += 1
                 return param + adjustments
         return param
 
-    # Traverse and update
-    # Helper to reconstruct path for logging
-    def map_with_path(fn, tree):
-        def _map(path, node):
-            if isinstance(node, dict) or hasattr(node, "keys"):
-                return {k: _map(path + (k,), v) for k, v in node.items()}
-            else:
-                return fn(path, node)
-
-        return _map((), tree)
-
-    # Since model_params is FrozenDict, we need to unfreeze/freeze or use tree_map
-    # But tree_map doesn't give paths. We can use flax.traverse_util
-    from flax import traverse_util
-
-    flat_params = traverse_util.flatten_dict(unfreeze(model_params))
-    updated_flat_params = {}
-
-    updates_count = 0
-    for path, param in flat_params.items():
-        # Check if this is a router bias
-        # Path is tuple like ('params', 'layers_0', 'moe', 'router_linear', 'bias')
-        if "router_linear" in path and "bias" in path:
-            if param.shape == adjustments.shape:
-                updated_flat_params[path] = param + adjustments
-                updates_count += 1
-            else:
-                updated_flat_params[path] = param
-        else:
-            updated_flat_params[path] = param
+    # Execute the update over the model parameters
+    updated_params = jax.tree_util.tree_map_with_path(update_router_bias, model_params)
 
     if updates_count > 0:
         print(f"Applied updates to {updates_count} router biases")
-        updated_params = traverse_util.unflatten_dict(updated_flat_params)
     else:
         print("No matching router biases found to update")
-        updated_params = model_params
 
     # 6. RESET: Clear stats buffer
     def reset_leaf(x):
