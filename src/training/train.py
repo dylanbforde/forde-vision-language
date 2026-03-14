@@ -165,7 +165,10 @@ def train_step(state, batch, vocab_size, aux_loss_weight):
     state = state.replace(stats_buffer=new_mutable_vars["stats_buffer"])
 
     # Compute gradient norm for monitoring
-    grad_norm = jnp.sqrt(sum(jnp.sum(x**2) for x in jax.tree.leaves(grads)))
+    # Optimized: Use array reduction instead of unrolling Python sum over PyTree leaves
+    # to avoid massive XLA graph bloat during JIT compilation.
+    sq_norms = jax.tree.map(lambda x: jnp.sum(jnp.square(x)), grads)
+    grad_norm = jnp.sqrt(jnp.sum(jnp.array(jax.tree.leaves(sq_norms))))
     metrics["grad_norm"] = grad_norm
 
     return state, metrics

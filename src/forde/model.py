@@ -447,7 +447,8 @@ if __name__ == "__main__":
         return lm_loss + aux_loss
 
     grads = jax.grad(loss_fn)(variables["params"], input_ids, labels)
-    grad_norm = jnp.sqrt(sum(jnp.sum(x**2) for x in jax.tree.leaves(grads)))
+    sq_norms = jax.tree.map(lambda x: jnp.sum(jnp.square(x)), grads)
+    grad_norm = jnp.sqrt(jnp.sum(jnp.array(jax.tree.leaves(sq_norms))))
     print(f"Gradient norm: {grad_norm:.4f}")
 
     print("\n" + "=" * 60)
