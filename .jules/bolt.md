@@ -1,3 +1,7 @@
 ## 2024-05-23 - MoE Routing Optimization
 **Learning:** Significant speedups can be achieved in MoE routing by replacing `argsort` with `jax.lax.top_k` (~18x) and `one_hot().sum()` with `jnp.bincount` (~15x). However, these gains may be masked by inefficient expert execution loops in naive implementations.
 **Action:** Always verify micro-benchmarks for component-level optimizations when end-to-end impact is limited by other bottlenecks. Ensure `uv.lock` is not accidentally modified during dependency resolution.
+
+## 2024-05-23 - Avoid vmap and transpose for large array reductions
+**Learning:** For reduction operations on large batch tensors in JAX (like Hoyer sparsity calculation), `vmap` combined with `transpose` can cause massive pre-allocation memory overhead and slow execution times compared to explicitly vectorizing operations along a specific axis (e.g., `axis=0`). Benchmarks showed explicitly vectorizing operations along the batch dimension can run ~5x faster (from 1.20s to 0.22s).
+**Action:** When performing reductions along a single dimension over a large batch, prefer to explicitly vectorize the operations along a specific axis (e.g., by adding an `axis` argument to the inner function) over `jax.vmap` combined with `transpose`.
