@@ -27,7 +27,7 @@ try:
         StreamCollapser,
     )
 except ModuleNotFoundError:
-    from moe import MoELayer, MoEStatefulLayer
+    from moe import MoEStatefulLayer
     from sparse_attention import NativeSparseAttention, CausalSelfAttention
     from hyper_connections import (
         HyperConnectionStream,
