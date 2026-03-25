@@ -156,33 +156,23 @@ class MoELayer(nn.Module):
         Returns:
             output: (batch, seq, d_model)
         """
-        batch_size, seq_len, d_model = x.shape
-
-        # Compute output from all experts (can be optimized with masking)
-        # Shape: (num_experts, batch, seq, d_model)
-        all_expert_outputs = jnp.stack([expert(x) for expert in experts], axis=0)
-
         # Initialize output accumulator
         output = jnp.zeros_like(x)
 
-        # For each selected expert position in top_k
-        for k in range(self.top_k):
-            # Get expert indices for this k
-            expert_idx = top_k_indices[..., k]  # (batch, seq)
-            weights = top_k_probs[..., k : k + 1]  # (batch, seq, 1)
+        # For each expert, evaluate and accumulate if routed
+        for i, expert in enumerate(experts):
+            # Mask identifying where this expert was selected
+            mask = top_k_indices == i
+            # Sum the probabilities for this expert across top_k selections
+            expert_weights = jnp.sum(top_k_probs * mask, axis=-1, keepdims=True)
 
-            # Gather expert outputs for selected experts
-            # Create advanced indexing
-            batch_indices = jnp.arange(batch_size)[:, None]
-            seq_indices = jnp.arange(seq_len)[None, :]
+            # Compute expert output for all tokens
+            expert_out = expert(x)
 
-            # Gather: all_expert_outputs[expert_idx[b,s], b, s, :]
-            selected_output = all_expert_outputs[
-                expert_idx, batch_indices, seq_indices, :
-            ]
-
-            # Weighted sum
-            output = output + weights * selected_output
+            # Add conditionally only where the expert was selected
+            output = jnp.where(
+                expert_weights > 0, output + expert_weights * expert_out, output
+            )
 
         return output
 
