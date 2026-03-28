@@ -158,31 +158,32 @@ class MoELayer(nn.Module):
         """
         batch_size, seq_len, d_model = x.shape
 
-        # Compute output from all experts (can be optimized with masking)
-        # Shape: (num_experts, batch, seq, d_model)
-        all_expert_outputs = jnp.stack([expert(x) for expert in experts], axis=0)
-
         # Initialize output accumulator
         output = jnp.zeros_like(x)
 
-        # For each selected expert position in top_k
-        for k in range(self.top_k):
-            # Get expert indices for this k
-            expert_idx = top_k_indices[..., k]  # (batch, seq)
-            weights = top_k_probs[..., k : k + 1]  # (batch, seq, 1)
+        # For each expert, compute its output and add it to the final output
+        # where the token is routed to this expert.
+        for expert_idx, expert in enumerate(experts):
+            # Mask identifying which tokens selected this expert
+            # Shape: (batch, seq, top_k)
+            expert_mask = top_k_indices == expert_idx
 
-            # Gather expert outputs for selected experts
-            # Create advanced indexing
-            batch_indices = jnp.arange(batch_size)[:, None]
-            seq_indices = jnp.arange(seq_len)[None, :]
+            # Check if this expert is selected by any token
+            # Note: We compute for all tokens but only accumulate where selected
+            # This avoids jnp.stack and massive intermediate memory allocations
 
-            # Gather: all_expert_outputs[expert_idx[b,s], b, s, :]
-            selected_output = all_expert_outputs[
-                expert_idx, batch_indices, seq_indices, :
-            ]
+            # Compute expert output for all tokens
+            # Shape: (batch, seq, d_model)
+            expert_output = expert(x)
 
-            # Weighted sum
-            output = output + weights * selected_output
+            # For each k in top_k, accumulate if selected
+            for k in range(self.top_k):
+                # Shape: (batch, seq, 1)
+                selected = expert_mask[..., k : k + 1]
+                weight = top_k_probs[..., k : k + 1]
+
+                # Add to output: output + weight * expert_output (only where selected)
+                output = output + jnp.where(selected, weight * expert_output, 0.0)
 
         return output
 
