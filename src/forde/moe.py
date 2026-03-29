@@ -144,8 +144,10 @@ class MoELayer(nn.Module):
         """
         Compute weighted combination of expert outputs for each token.
 
-        This is a simplified implementation that loops over experts.
-        For production, use optimized gather-scatter or capacity-based routing.
+        Optimized implementation: iterates over experts and accumulates the
+        results instead of eagerly stacking all expert outputs into a single
+        massive tensor. This dramatically reduces XLA compilation time and
+        memory overhead.
 
         Args:
             x: (batch, seq, d_model)
@@ -156,33 +158,22 @@ class MoELayer(nn.Module):
         Returns:
             output: (batch, seq, d_model)
         """
-        batch_size, seq_len, d_model = x.shape
-
-        # Compute output from all experts (can be optimized with masking)
-        # Shape: (num_experts, batch, seq, d_model)
-        all_expert_outputs = jnp.stack([expert(x) for expert in experts], axis=0)
-
         # Initialize output accumulator
         output = jnp.zeros_like(x)
 
-        # For each selected expert position in top_k
-        for k in range(self.top_k):
-            # Get expert indices for this k
-            expert_idx = top_k_indices[..., k]  # (batch, seq)
-            weights = top_k_probs[..., k : k + 1]  # (batch, seq, 1)
+        # Iterate over experts and accumulate outputs
+        for i, expert in enumerate(experts):
+            # Create boolean mask for tokens assigned to expert i
+            expert_mask = top_k_indices == i  # (batch, seq, top_k)
 
-            # Gather expert outputs for selected experts
-            # Create advanced indexing
-            batch_indices = jnp.arange(batch_size)[:, None]
-            seq_indices = jnp.arange(seq_len)[None, :]
+            # Sum probabilities across the top_k dimension for this expert
+            expert_weights = jnp.sum(expert_mask * top_k_probs, axis=-1, keepdims=True)
 
-            # Gather: all_expert_outputs[expert_idx[b,s], b, s, :]
-            selected_output = all_expert_outputs[
-                expert_idx, batch_indices, seq_indices, :
-            ]
+            # Compute expert output for all tokens
+            expert_out = expert(x)
 
-            # Weighted sum
-            output = output + weights * selected_output
+            # Accumulate weighted outputs
+            output = output + expert_out * expert_weights
 
         return output
 
