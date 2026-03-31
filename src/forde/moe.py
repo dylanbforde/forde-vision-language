@@ -144,8 +144,9 @@ class MoELayer(nn.Module):
         """
         Compute weighted combination of expert outputs for each token.
 
-        This is a simplified implementation that loops over experts.
-        For production, use optimized gather-scatter or capacity-based routing.
+        Optimized to avoid eagerly computing and stacking all expert outputs
+        into a massive intermediate tensor using jnp.stack, drastically
+        improving XLA compilation times and reducing memory overhead.
 
         Args:
             x: (batch, seq, d_model)
@@ -157,32 +158,24 @@ class MoELayer(nn.Module):
             output: (batch, seq, d_model)
         """
         batch_size, seq_len, d_model = x.shape
-
-        # Compute output from all experts (can be optimized with masking)
-        # Shape: (num_experts, batch, seq, d_model)
-        all_expert_outputs = jnp.stack([expert(x) for expert in experts], axis=0)
-
-        # Initialize output accumulator
         output = jnp.zeros_like(x)
 
-        # For each selected expert position in top_k
-        for k in range(self.top_k):
-            # Get expert indices for this k
-            expert_idx = top_k_indices[..., k]  # (batch, seq)
-            weights = top_k_probs[..., k : k + 1]  # (batch, seq, 1)
+        # Iterate over experts and accumulate the results to avoid massive
+        # (num_experts, batch, seq, d_model) intermediate tensor allocations
+        for i, expert in enumerate(experts):
+            # Compute expert output for all tokens
+            expert_out = expert(x)
 
-            # Gather expert outputs for selected experts
-            # Create advanced indexing
-            batch_indices = jnp.arange(batch_size)[:, None]
-            seq_indices = jnp.arange(seq_len)[None, :]
+            # Find tokens assigned to this expert across all top_k choices
+            # and accumulate their probabilities
+            expert_prob_sum = jnp.zeros((batch_size, seq_len))
+            for k in range(self.top_k):
+                expert_prob_sum += jnp.where(
+                    top_k_indices[..., k] == i, top_k_probs[..., k], 0.0
+                )
 
-            # Gather: all_expert_outputs[expert_idx[b,s], b, s, :]
-            selected_output = all_expert_outputs[
-                expert_idx, batch_indices, seq_indices, :
-            ]
-
-            # Weighted sum
-            output = output + weights * selected_output
+            # Add to output (only non-zero where expert was selected)
+            output += expert_prob_sum[..., None] * expert_out
 
         return output
 
