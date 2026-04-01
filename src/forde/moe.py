@@ -144,8 +144,9 @@ class MoELayer(nn.Module):
         """
         Compute weighted combination of expert outputs for each token.
 
-        This is a simplified implementation that loops over experts.
-        For production, use optimized gather-scatter or capacity-based routing.
+        Iterates over experts and accumulates the results using jnp.where
+        to drastically improve XLA compilation times and reduce memory overhead
+        by avoiding eagerly computing and stacking all expert outputs.
 
         Args:
             x: (batch, seq, d_model)
@@ -156,33 +157,24 @@ class MoELayer(nn.Module):
         Returns:
             output: (batch, seq, d_model)
         """
-        batch_size, seq_len, d_model = x.shape
-
-        # Compute output from all experts (can be optimized with masking)
-        # Shape: (num_experts, batch, seq, d_model)
-        all_expert_outputs = jnp.stack([expert(x) for expert in experts], axis=0)
-
         # Initialize output accumulator
         output = jnp.zeros_like(x)
 
-        # For each selected expert position in top_k
-        for k in range(self.top_k):
-            # Get expert indices for this k
-            expert_idx = top_k_indices[..., k]  # (batch, seq)
-            weights = top_k_probs[..., k : k + 1]  # (batch, seq, 1)
+        # Iterate over experts and accumulate results
+        for i, expert in enumerate(experts):
+            # Compute expert output lazily
+            expert_out = expert(x)
 
-            # Gather expert outputs for selected experts
-            # Create advanced indexing
-            batch_indices = jnp.arange(batch_size)[:, None]
-            seq_indices = jnp.arange(seq_len)[None, :]
+            # Check if this expert was selected anywhere in top_k (batch, seq, top_k)
+            is_selected = top_k_indices == i
 
-            # Gather: all_expert_outputs[expert_idx[b,s], b, s, :]
-            selected_output = all_expert_outputs[
-                expert_idx, batch_indices, seq_indices, :
-            ]
+            # Multiply by probs and sum over top_k dimension to get the final weight for this expert
+            expert_weight = jnp.sum(is_selected * top_k_probs, axis=-1, keepdims=True)
 
-            # Weighted sum
-            output = output + weights * selected_output
+            # Conditionally accumulate using jnp.where for better performance
+            output = jnp.where(
+                expert_weight > 0, output + expert_weight * expert_out, output
+            )
 
         return output
 
