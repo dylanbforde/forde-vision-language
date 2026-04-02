@@ -158,31 +158,26 @@ class MoELayer(nn.Module):
         """
         batch_size, seq_len, d_model = x.shape
 
-        # Compute output from all experts (can be optimized with masking)
-        # Shape: (num_experts, batch, seq, d_model)
-        all_expert_outputs = jnp.stack([expert(x) for expert in experts], axis=0)
-
         # Initialize output accumulator
         output = jnp.zeros_like(x)
 
-        # For each selected expert position in top_k
-        for k in range(self.top_k):
-            # Get expert indices for this k
-            expert_idx = top_k_indices[..., k]  # (batch, seq)
-            weights = top_k_probs[..., k : k + 1]  # (batch, seq, 1)
+        # Iterate over all experts instead of computing all outputs at once and jnp.stacking
+        # jnp.stack creates a massive intermediate array and causes huge XLA compile bloat
+        for i, expert in enumerate(experts):
+            # Check where this expert is selected among the top_k
+            is_selected = top_k_indices == i  # (batch, seq, top_k)
 
-            # Gather expert outputs for selected experts
-            # Create advanced indexing
-            batch_indices = jnp.arange(batch_size)[:, None]
-            seq_indices = jnp.arange(seq_len)[None, :]
+            # Sum weights if selected (handles case where expert is selected multiple times, though rare)
+            expert_weights = jnp.sum(
+                jnp.where(is_selected, top_k_probs, 0.0), axis=-1, keepdims=True
+            )  # (batch, seq, 1)
 
-            # Gather: all_expert_outputs[expert_idx[b,s], b, s, :]
-            selected_output = all_expert_outputs[
-                expert_idx, batch_indices, seq_indices, :
-            ]
+            # JAX will still execute the expert for all tokens, but we mask the output
+            # This avoids the huge intermediate jnp.stack allocation and is much faster to compile
+            expert_out = expert(x)
 
             # Weighted sum
-            output = output + weights * selected_output
+            output = output + expert_weights * expert_out
 
         return output
 
