@@ -1,15 +1,13 @@
-
 import jax
 import jax.numpy as jnp
-import pytest
-from flax import linen as nn
 import sys
 import os
 
 # Ensure src is in path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../src')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../src")))
 
 from forde.moe import MoELayer
+
 
 def test_moe_forward_pass():
     """Test that MoELayer runs correctly and produces valid outputs."""
@@ -27,7 +25,7 @@ def test_moe_forward_pass():
         num_experts=num_experts,
         top_k=top_k,
         expert_hidden_dim=expert_hidden_dim,
-        d_model=d_model
+        d_model=d_model,
     )
 
     variables = moe.init(key, x)
@@ -50,6 +48,7 @@ def test_moe_forward_pass():
     # Basic value check (smoke test for consistency with PRNG)
     # This value might change if initialization changes, but ensures deterministic behavior
     assert output.mean() != 0.0
+
 
 if __name__ == "__main__":
     test_moe_forward_pass()
