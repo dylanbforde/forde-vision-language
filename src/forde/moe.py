@@ -158,31 +158,23 @@ class MoELayer(nn.Module):
         """
         batch_size, seq_len, d_model = x.shape
 
-        # Compute output from all experts (can be optimized with masking)
-        # Shape: (num_experts, batch, seq, d_model)
-        all_expert_outputs = jnp.stack([expert(x) for expert in experts], axis=0)
-
         # Initialize output accumulator
         output = jnp.zeros_like(x)
 
-        # For each selected expert position in top_k
-        for k in range(self.top_k):
-            # Get expert indices for this k
-            expert_idx = top_k_indices[..., k]  # (batch, seq)
-            weights = top_k_probs[..., k : k + 1]  # (batch, seq, 1)
+        # Compute output iteratively to avoid massive memory allocations
+        # associated with stacking all expert outputs in XLA compilation.
+        for i, expert in enumerate(experts):
+            # Compute this expert's output
+            expert_out = expert(x)
 
-            # Gather expert outputs for selected experts
-            # Create advanced indexing
-            batch_indices = jnp.arange(batch_size)[:, None]
-            seq_indices = jnp.arange(seq_len)[None, :]
+            # Check if this expert was selected in any of the top_k positions
+            for k in range(self.top_k):
+                # Mask: 1 where expert i is selected at position k, 0 otherwise
+                mask = (top_k_indices[..., k] == i)[..., None]
+                weights = top_k_probs[..., k : k + 1]
 
-            # Gather: all_expert_outputs[expert_idx[b,s], b, s, :]
-            selected_output = all_expert_outputs[
-                expert_idx, batch_indices, seq_indices, :
-            ]
-
-            # Weighted sum
-            output = output + weights * selected_output
+                # Accumulate the weighted output if selected
+                output = jnp.where(mask, output + expert_out * weights, output)
 
         return output
 
