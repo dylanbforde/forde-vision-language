@@ -156,33 +156,24 @@ class MoELayer(nn.Module):
         Returns:
             output: (batch, seq, d_model)
         """
-        batch_size, seq_len, d_model = x.shape
-
-        # Compute output from all experts (can be optimized with masking)
-        # Shape: (num_experts, batch, seq, d_model)
-        all_expert_outputs = jnp.stack([expert(x) for expert in experts], axis=0)
-
         # Initialize output accumulator
         output = jnp.zeros_like(x)
 
-        # For each selected expert position in top_k
-        for k in range(self.top_k):
-            # Get expert indices for this k
-            expert_idx = top_k_indices[..., k]  # (batch, seq)
-            weights = top_k_probs[..., k : k + 1]  # (batch, seq, 1)
+        # Iterate over experts and accumulate results
+        # This avoids stacking all expert outputs into a large intermediate tensor
+        for i, expert in enumerate(experts):
+            expert_output = expert(x)
 
-            # Gather expert outputs for selected experts
-            # Create advanced indexing
-            batch_indices = jnp.arange(batch_size)[:, None]
-            seq_indices = jnp.arange(seq_len)[None, :]
+            # Create a mask for tokens routed to this expert
+            # mask shape: (batch, seq, top_k)
+            mask = top_k_indices == i
 
-            # Gather: all_expert_outputs[expert_idx[b,s], b, s, :]
-            selected_output = all_expert_outputs[
-                expert_idx, batch_indices, seq_indices, :
-            ]
+            # Combine mask with probabilities and sum over top_k dimension
+            # weight shape: (batch, seq, 1)
+            weight = jnp.sum(mask * top_k_probs, axis=-1, keepdims=True)
 
-            # Weighted sum
-            output = output + weights * selected_output
+            # Accumulate
+            output = output + weight * expert_output
 
         return output
 
