@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 # Handle imports for both package and script execution
 try:
-    from src.forde.moe import MoELayer, MoEStatefulLayer
+    from src.forde.moe import MoEStatefulLayer
     from src.forde.sparse_attention import NativeSparseAttention, CausalSelfAttention
     from src.forde.hyper_connections import (
         HyperConnectionStream,
@@ -27,7 +27,7 @@ try:
         StreamCollapser,
     )
 except ModuleNotFoundError:
-    from moe import MoELayer, MoEStatefulLayer
+    from moe import MoEStatefulLayer
     from sparse_attention import NativeSparseAttention, CausalSelfAttention
     from hyper_connections import (
         HyperConnectionStream,
@@ -407,7 +407,8 @@ if __name__ == "__main__":
 
     # Forward pass
     print("\nRunning forward pass...")
-    logits, aux_loss = model.apply(variables, input_ids)
+    outputs, mutated_vars = model.apply(variables, input_ids, mutable=["stats_buffer"])
+    logits, aux_loss = outputs
 
     print(f"Input shape: {input_ids.shape}")
     print(f"Output logits shape: {logits.shape}")
@@ -438,7 +439,13 @@ if __name__ == "__main__":
     print("\nTesting gradient computation...")
 
     def loss_fn(params, input_ids, labels):
-        logits, aux_loss = model.apply({"params": params}, input_ids)
+        # We need stats_buffer since we use MoEStatefulLayer
+        outputs, _ = model.apply(
+            {"params": params, "stats_buffer": variables["stats_buffer"]},
+            input_ids,
+            mutable=["stats_buffer"]
+        )
+        logits, aux_loss = outputs
         shift_logits = logits[:, :-1, :]
         shift_labels = labels[:, 1:]
         lm_loss = optax.softmax_cross_entropy_with_integer_labels(
