@@ -156,33 +156,28 @@ class MoELayer(nn.Module):
         Returns:
             output: (batch, seq, d_model)
         """
-        batch_size, seq_len, d_model = x.shape
-
-        # Compute output from all experts (can be optimized with masking)
-        # Shape: (num_experts, batch, seq, d_model)
-        all_expert_outputs = jnp.stack([expert(x) for expert in experts], axis=0)
-
         # Initialize output accumulator
         output = jnp.zeros_like(x)
 
-        # For each selected expert position in top_k
-        for k in range(self.top_k):
-            # Get expert indices for this k
-            expert_idx = top_k_indices[..., k]  # (batch, seq)
-            weights = top_k_probs[..., k : k + 1]  # (batch, seq, 1)
+        # Bolt Optimization: Avoid eagerly computing and stacking all expert outputs
+        # into a massive tensor which causes silent OOMs on large compilations.
+        # Instead, iterate over experts, compute their outputs, and accumulate
+        # using boolean masking (jnp.where).
+        for i, expert in enumerate(experts):
+            expert_out = expert(x)
 
-            # Gather expert outputs for selected experts
-            # Create advanced indexing
-            batch_indices = jnp.arange(batch_size)[:, None]
-            seq_indices = jnp.arange(seq_len)[None, :]
+            # Find where this expert was selected in top-k
+            # expert_mask: (batch, seq, top_k)
+            expert_mask = top_k_indices == i
 
-            # Gather: all_expert_outputs[expert_idx[b,s], b, s, :]
-            selected_output = all_expert_outputs[
-                expert_idx, batch_indices, seq_indices, :
-            ]
+            # Sum the probabilities for this expert (it could theoretically be selected multiple times,
+            # though top-k usually produces distinct indices, summing is safe and gets shape (batch, seq, 1))
+            expert_weights = jnp.sum(expert_mask * top_k_probs, axis=-1, keepdims=True)
 
-            # Weighted sum
-            output = output + weights * selected_output
+            # Accumulate output if weight > 0
+            output = output + jnp.where(
+                expert_weights > 0, expert_weights * expert_out, 0
+            )
 
         return output
 
