@@ -144,8 +144,9 @@ class MoELayer(nn.Module):
         """
         Compute weighted combination of expert outputs for each token.
 
-        This is a simplified implementation that loops over experts.
-        For production, use optimized gather-scatter or capacity-based routing.
+        This is an optimized implementation that accumulates outputs per expert
+        using boolean masking (jnp.where) to avoid allocating a massive
+        intermediate tensor and to speed up XLA compilation and execution.
 
         Args:
             x: (batch, seq, d_model)
@@ -156,33 +157,27 @@ class MoELayer(nn.Module):
         Returns:
             output: (batch, seq, d_model)
         """
-        batch_size, seq_len, d_model = x.shape
-
-        # Compute output from all experts (can be optimized with masking)
-        # Shape: (num_experts, batch, seq, d_model)
-        all_expert_outputs = jnp.stack([expert(x) for expert in experts], axis=0)
-
         # Initialize output accumulator
         output = jnp.zeros_like(x)
 
-        # For each selected expert position in top_k
-        for k in range(self.top_k):
-            # Get expert indices for this k
-            expert_idx = top_k_indices[..., k]  # (batch, seq)
-            weights = top_k_probs[..., k : k + 1]  # (batch, seq, 1)
+        for i, expert in enumerate(experts):
+            # Evaluate expert output
+            expert_out = expert(x)
 
-            # Gather expert outputs for selected experts
-            # Create advanced indexing
-            batch_indices = jnp.arange(batch_size)[:, None]
-            seq_indices = jnp.arange(seq_len)[None, :]
+            # Find tokens where this expert was selected in top_k
+            expert_mask = top_k_indices == i
 
-            # Gather: all_expert_outputs[expert_idx[b,s], b, s, :]
-            selected_output = all_expert_outputs[
-                expert_idx, batch_indices, seq_indices, :
-            ]
+            # Sum the probabilities for this expert across the top_k dimension
+            # Shape: (batch, seq, 1)
+            expert_weight = jnp.sum(
+                jnp.where(expert_mask, top_k_probs, 0.0), axis=-1, keepdims=True
+            )
 
-            # Weighted sum
-            output = output + weights * selected_output
+            # Conditionally accumulate output to avoid NaN gradients on unused branches
+            # and allow XLA to optimize the addition
+            output = output + jnp.where(
+                expert_weight > 0, expert_weight * expert_out, 0.0
+            )
 
         return output
 
