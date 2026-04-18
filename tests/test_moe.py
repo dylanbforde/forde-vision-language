@@ -2,14 +2,13 @@ import jax
 import jax.numpy as jnp
 import sys
 import os
-import pytest
-from flax import linen as nn
 
 # Add src to path
 sys.path.append(os.path.join(os.path.dirname(__file__), "../src"))
 
 from forde.moe import MoELayer
 from forde.sparse_attention import NativeSparseAttention, TopKSelection
+
 
 def test_moe_layer_shapes():
     key = jax.random.PRNGKey(42)
@@ -18,10 +17,7 @@ def test_moe_layer_shapes():
     top_k = 2
 
     moe = MoELayer(
-        num_experts=num_experts,
-        top_k=top_k,
-        expert_hidden_dim=128,
-        d_model=d_model
+        num_experts=num_experts, top_k=top_k, expert_hidden_dim=128, d_model=d_model
     )
 
     x = jax.random.normal(key, (batch, seq, d_model))
@@ -37,16 +33,19 @@ def test_moe_layer_shapes():
     # Note: router_probs are softmax outputs
     assert jnp.allclose(router_probs.sum(axis=-1), 1.0, atol=1e-5)
 
+
 def test_moe_top_k_consistency():
     # Verify that top-k selection logic works as expected (descending order)
     # This indirectly tests our argsort -> top_k replacement
-    key = jax.random.PRNGKey(101)
+    jax.random.PRNGKey(101)
 
     # Create dummy logits
-    logits = jnp.array([
-        [10.0, 2.0, 5.0, 8.0],  # Top 2: 0 (10.0), 3 (8.0)
-        [1.0, 9.0, 3.0, 4.0],   # Top 2: 1 (9.0), 3 (4.0)
-    ]).reshape(1, 2, 4)
+    logits = jnp.array(
+        [
+            [10.0, 2.0, 5.0, 8.0],  # Top 2: 0 (10.0), 3 (8.0)
+            [1.0, 9.0, 3.0, 4.0],  # Top 2: 1 (9.0), 3 (4.0)
+        ]
+    ).reshape(1, 2, 4)
 
     # We can't access private method _top_k_gating easily without init,
     # so we'll test the logic directly using lax.top_k vs argsort
@@ -69,16 +68,13 @@ def test_moe_top_k_consistency():
 
     assert jnp.array_equal(argsort_sorted, top_k_sorted)
 
+
 def test_sparse_attention_shapes():
     key = jax.random.PRNGKey(99)
     batch, seq, d_model = 2, 128, 64
 
     attn = NativeSparseAttention(
-        num_heads=4,
-        head_dim=16,
-        window_size=32,
-        compression_ratio=4,
-        top_k_global=16
+        num_heads=4, head_dim=16, window_size=32, compression_ratio=4, top_k_global=16
     )
 
     x = jax.random.normal(key, (batch, seq, d_model))
@@ -86,6 +82,7 @@ def test_sparse_attention_shapes():
     output = attn.apply(variables, x)
 
     assert output.shape == (batch, seq, d_model)
+
 
 def test_top_k_selection_module():
     key = jax.random.PRNGKey(77)

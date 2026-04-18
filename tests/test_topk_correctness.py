@@ -1,7 +1,6 @@
-
 import jax
 import jax.numpy as jnp
-import pytest
+
 
 def test_top_k_equivalence():
     key = jax.random.PRNGKey(42)
@@ -22,6 +21,7 @@ def test_top_k_equivalence():
 
     assert jnp.array_equal(indices_argsort_sorted, indices_topk_sorted)
     print("Indices match after sorting!")
+
 
 if __name__ == "__main__":
     test_top_k_equivalence()
