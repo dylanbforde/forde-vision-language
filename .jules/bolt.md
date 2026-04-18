@@ -1,3 +1,6 @@
 ## 2024-05-23 - MoE Routing Optimization
 **Learning:** Significant speedups can be achieved in MoE routing by replacing `argsort` with `jax.lax.top_k` (~18x) and `one_hot().sum()` with `jnp.bincount` (~15x). However, these gains may be masked by inefficient expert execution loops in naive implementations.
 **Action:** Always verify micro-benchmarks for component-level optimizations when end-to-end impact is limited by other bottlenecks. Ensure `uv.lock` is not accidentally modified during dependency resolution.
+## 2024-05-18 - JAX Loop Unrolling and Compile Time Bloat
+**Learning:** In JAX, explicitly looping over channels (e.g., using list comprehensions and `jnp.stack`) forces XLA to unroll the loop, resulting in massive computation graphs and dramatically increased compilation times, especially for operations like spatial convolutions (`convolve2d`, `convolve`).
+**Action:** Always prefer transposing axes to bring the iteration dimension to the front and applying `jax.vmap` instead of explicit Python loops. This keeps the XLA graph compact, yields ~2x faster JIT compilation, and ~3x-4x faster execution time. Additionally, pad operations should be hoisted outside the loop to pad the entire N-dimensional array at once.
