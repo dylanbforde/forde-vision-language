@@ -1,3 +1,3 @@
-## 2024-05-23 - MoE Routing Optimization
-**Learning:** Significant speedups can be achieved in MoE routing by replacing `argsort` with `jax.lax.top_k` (~18x) and `one_hot().sum()` with `jnp.bincount` (~15x). However, these gains may be masked by inefficient expert execution loops in naive implementations.
-**Action:** Always verify micro-benchmarks for component-level optimizations when end-to-end impact is limited by other bottlenecks. Ensure `uv.lock` is not accidentally modified during dependency resolution.
+## 2024-06-25 - JAX MoE Eager Stacking OOM
+**Learning:** In JAX/Flax MoE routing, aggressively stacking all expert outputs into a single giant tensor via `jnp.stack([expert(x) for expert in experts])` causes the XLA compiler to bloat and can silently run out of memory (OOM) during JIT compilation or execution for large expert counts or batch sizes.
+**Action:** Always iterate over individual experts explicitly and accumulate their outputs conditionally using boolean masking (e.g., `jnp.where`) when computing MoE outputs. This keeps the XLA graph highly compact, uses significantly less compilation memory, and often performs faster overall.
