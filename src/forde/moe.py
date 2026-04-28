@@ -158,31 +158,28 @@ class MoELayer(nn.Module):
         """
         batch_size, seq_len, d_model = x.shape
 
-        # Compute output from all experts (can be optimized with masking)
-        # Shape: (num_experts, batch, seq, d_model)
-        all_expert_outputs = jnp.stack([expert(x) for expert in experts], axis=0)
-
         # Initialize output accumulator
         output = jnp.zeros_like(x)
 
-        # For each selected expert position in top_k
-        for k in range(self.top_k):
-            # Get expert indices for this k
-            expert_idx = top_k_indices[..., k]  # (batch, seq)
-            weights = top_k_probs[..., k : k + 1]  # (batch, seq, 1)
+        # Iterate over experts directly.
+        # This avoids jnp.stack silent OOMs on large XLA compilations.
+        for i, expert in enumerate(experts):
+            # Compute expert output eagerly inside the loop for memory efficiency
+            expert_out = expert(x)
 
-            # Gather expert outputs for selected experts
-            # Create advanced indexing
-            batch_indices = jnp.arange(batch_size)[:, None]
-            seq_indices = jnp.arange(seq_len)[None, :]
+            # Create mask for tokens assigned to this expert across top_k
+            # mask shape: (batch, seq, top_k)
+            mask = top_k_indices == i
 
-            # Gather: all_expert_outputs[expert_idx[b,s], b, s, :]
-            selected_output = all_expert_outputs[
-                expert_idx, batch_indices, seq_indices, :
-            ]
+            # Get weights for this expert, sum over top_k to aggregate
+            # (token is assigned to this expert usually once per top_k)
+            # expert_weight shape: (batch, seq, 1)
+            expert_weight = jnp.sum(
+                jnp.where(mask, top_k_probs, 0.0), axis=-1, keepdims=True
+            )
 
-            # Weighted sum
-            output = output + weights * selected_output
+            # Accumulate output
+            output = output + expert_weight * expert_out
 
         return output
 
