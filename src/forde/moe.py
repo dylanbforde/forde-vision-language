@@ -144,8 +144,8 @@ class MoELayer(nn.Module):
         """
         Compute weighted combination of expert outputs for each token.
 
-        This is a simplified implementation that loops over experts.
-        For production, use optimized gather-scatter or capacity-based routing.
+        Iterates over experts individually, calculates outputs, and accumulates
+        using boolean masking to avoid eager memory allocation and compilation OOMs.
 
         Args:
             x: (batch, seq, d_model)
@@ -156,33 +156,26 @@ class MoELayer(nn.Module):
         Returns:
             output: (batch, seq, d_model)
         """
-        batch_size, seq_len, d_model = x.shape
-
-        # Compute output from all experts (can be optimized with masking)
-        # Shape: (num_experts, batch, seq, d_model)
-        all_expert_outputs = jnp.stack([expert(x) for expert in experts], axis=0)
-
         # Initialize output accumulator
         output = jnp.zeros_like(x)
 
-        # For each selected expert position in top_k
-        for k in range(self.top_k):
-            # Get expert indices for this k
-            expert_idx = top_k_indices[..., k]  # (batch, seq)
-            weights = top_k_probs[..., k : k + 1]  # (batch, seq, 1)
+        # Iterate over experts and accumulate outputs via boolean masking
+        for expert_id, expert in enumerate(experts):
+            # Compute expert output only once
+            expert_out = expert(x)
 
-            # Gather expert outputs for selected experts
-            # Create advanced indexing
-            batch_indices = jnp.arange(batch_size)[:, None]
-            seq_indices = jnp.arange(seq_len)[None, :]
+            # Create mask for where this expert was selected
+            expert_mask = top_k_indices == expert_id
 
-            # Gather: all_expert_outputs[expert_idx[b,s], b, s, :]
-            selected_output = all_expert_outputs[
-                expert_idx, batch_indices, seq_indices, :
-            ]
+            # Get weights for this expert where it was selected, else 0
+            expert_weights = jnp.sum(
+                jnp.where(expert_mask, top_k_probs, 0.0), axis=-1, keepdims=True
+            )
 
-            # Weighted sum
-            output = output + weights * selected_output
+            # Accumulate output: only multiply if weight > 0
+            output = output + jnp.where(
+                expert_weights > 0, expert_weights * expert_out, 0.0
+            )
 
         return output
 
