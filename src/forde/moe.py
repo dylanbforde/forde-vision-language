@@ -158,31 +158,34 @@ class MoELayer(nn.Module):
         """
         batch_size, seq_len, d_model = x.shape
 
-        # Compute output from all experts (can be optimized with masking)
-        # Shape: (num_experts, batch, seq, d_model)
-        all_expert_outputs = jnp.stack([expert(x) for expert in experts], axis=0)
-
         # Initialize output accumulator
         output = jnp.zeros_like(x)
 
-        # For each selected expert position in top_k
-        for k in range(self.top_k):
-            # Get expert indices for this k
-            expert_idx = top_k_indices[..., k]  # (batch, seq)
-            weights = top_k_probs[..., k : k + 1]  # (batch, seq, 1)
+        # Iterate over experts individually to avoid allocating a massive stacked tensor,
+        # which can cause silent OOMs during XLA compilation.
+        for i, expert in enumerate(experts):
+            # Compute expert output only when needed
+            expert_out = expert(x)
 
-            # Gather expert outputs for selected experts
-            # Create advanced indexing
-            batch_indices = jnp.arange(batch_size)[:, None]
-            seq_indices = jnp.arange(seq_len)[None, :]
+            # Create a mask for where this expert was selected in the top_k
+            # expert_mask: (batch, seq, top_k)
+            expert_mask = (top_k_indices == i)
 
-            # Gather: all_expert_outputs[expert_idx[b,s], b, s, :]
-            selected_output = all_expert_outputs[
-                expert_idx, batch_indices, seq_indices, :
-            ]
+            # Extract the weights for this expert and sum over the top_k dimension
+            # (since an expert is usually only selected once per token, sum is fine)
+            # expert_weights: (batch, seq, 1)
+            expert_weights = jnp.sum(
+                jnp.where(expert_mask, top_k_probs, 0.0),
+                axis=-1,
+                keepdims=True
+            )
 
-            # Weighted sum
-            output = output + weights * selected_output
+            # Accumulate output using boolean masking
+            output = output + jnp.where(
+                expert_weights > 0,
+                expert_weights * expert_out,
+                0.0
+            )
 
         return output
 
