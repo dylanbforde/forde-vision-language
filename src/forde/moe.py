@@ -156,33 +156,22 @@ class MoELayer(nn.Module):
         Returns:
             output: (batch, seq, d_model)
         """
-        batch_size, seq_len, d_model = x.shape
-
-        # Compute output from all experts (can be optimized with masking)
-        # Shape: (num_experts, batch, seq, d_model)
-        all_expert_outputs = jnp.stack([expert(x) for expert in experts], axis=0)
-
         # Initialize output accumulator
         output = jnp.zeros_like(x)
 
-        # For each selected expert position in top_k
-        for k in range(self.top_k):
-            # Get expert indices for this k
-            expert_idx = top_k_indices[..., k]  # (batch, seq)
-            weights = top_k_probs[..., k : k + 1]  # (batch, seq, 1)
+        # Iterate over each expert individually instead of stacking all outputs
+        # This avoids massive memory allocations during XLA compilation
+        for i, expert in enumerate(experts):
+            # Compute sum of weights for this expert across all top_k positions
+            # Shape: (batch, seq, 1)
+            expert_weights = jnp.sum(
+                jnp.where(top_k_indices == i, top_k_probs, 0.0), axis=-1, keepdims=True
+            )
 
-            # Gather expert outputs for selected experts
-            # Create advanced indexing
-            batch_indices = jnp.arange(batch_size)[:, None]
-            seq_indices = jnp.arange(seq_len)[None, :]
-
-            # Gather: all_expert_outputs[expert_idx[b,s], b, s, :]
-            selected_output = all_expert_outputs[
-                expert_idx, batch_indices, seq_indices, :
-            ]
-
-            # Weighted sum
-            output = output + weights * selected_output
+            # Only compute and accumulate if the expert is selected for any token
+            # (XLA can sometimes optimize this, but the real benefit is avoiding jnp.stack)
+            expert_out = expert(x)
+            output = output + expert_weights * expert_out
 
         return output
 
