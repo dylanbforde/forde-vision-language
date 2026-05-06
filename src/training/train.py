@@ -61,7 +61,8 @@ def create_train_state(
     model = FORDEDecoderLM(config=config)
 
     # Initialize with dummy input
-    dummy_input = jnp.ones((1, 64), dtype=jnp.int32)
+    dummy_seq_len = min(64, config.max_seq_len)
+    dummy_input = jnp.ones((1, dummy_seq_len), dtype=jnp.int32)
     variables = model.init(key, dummy_input)
     params = variables["params"]
 
@@ -165,10 +166,70 @@ def train_step(state, batch, vocab_size, aux_loss_weight):
     state = state.replace(stats_buffer=new_mutable_vars["stats_buffer"])
 
     # Compute gradient norm for monitoring
-    grad_norm = jnp.sqrt(sum(jnp.sum(x**2) for x in jax.tree.leaves(grads)))
+    grad_norm = optax.global_norm(grads)
     metrics["grad_norm"] = grad_norm
 
     return state, metrics
+
+
+@jax.jit
+def eval_step(state, batch, aux_loss_weight):
+    """Evaluate one batch without applying gradients or retaining stats updates."""
+
+    (logits, aux_loss), _new_mutable_vars = state.apply_fn(
+        {"params": state.params, "stats_buffer": state.stats_buffer},
+        batch["input_ids"],
+        mutable=["stats_buffer"],
+    )
+    shift_logits = logits[:, :-1, :]
+    shift_labels = batch["input_ids"][:, 1:]
+    v_size = shift_logits.shape[-1]
+    lm_loss = optax.softmax_cross_entropy_with_integer_labels(
+        shift_logits.reshape(-1, v_size), shift_labels.reshape(-1)
+    ).mean()
+    total_loss = lm_loss + aux_loss_weight * aux_loss
+    perplexity = jnp.exp(jnp.minimum(lm_loss, 20.0))
+    return {
+        "lm_loss": lm_loss,
+        "aux_loss": aux_loss,
+        "total_loss": total_loss,
+        "perplexity": perplexity,
+    }
+
+
+def parse_role_priors(raw: str) -> tuple[float, ...]:
+    """Parse comma-separated role priors from the CLI."""
+    try:
+        return tuple(float(value.strip()) for value in raw.split(",") if value.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"Invalid --ot_role_priors value {raw!r}."
+        ) from exc
+
+
+def log_slow_loop_diagnostics(writer, diagnostics, step: int):
+    """Write scalar slow-loop diagnostics to TensorBoard."""
+    if writer is None:
+        return
+
+    scalar_keys = [
+        "load_imbalance",
+        "routing_entropy",
+        "router_entropy",
+        "assignment_churn",
+        "router_adjustment_norm",
+        "dustbin_mass",
+        "mean_dustbin_fraction",
+        "transport_entropy",
+        "mean_role_confidence",
+    ]
+    for key in scalar_keys:
+        if key in diagnostics:
+            writer.add_scalar(f"SlowLoop/{key}", float(jax.device_get(diagnostics[key])), step)
+
+    if "role_masses" in diagnostics:
+        for role_idx, mass in enumerate(jax.device_get(diagnostics["role_masses"])):
+            writer.add_scalar(f"SlowLoop/role_{role_idx}_mass", float(mass), step)
 
 
 def main():
@@ -189,6 +250,30 @@ def main():
     )
     parser.add_argument(
         "--log_interval", type=int, default=10, help="Steps between logging"
+    )
+    parser.add_argument(
+        "--eval_interval",
+        type=int,
+        default=0,
+        help="Steps between validation batches (0 to disable)",
+    )
+    parser.add_argument(
+        "--eval_batches",
+        type=int,
+        default=1,
+        help="Validation batches per evaluation interval",
+    )
+
+    # Data arguments
+    parser.add_argument("--dataset_name", type=str, default="wikitext")
+    parser.add_argument("--dataset_config", type=str, default=None)
+    parser.add_argument("--train_split", type=str, default="train")
+    parser.add_argument("--eval_dataset_name", type=str, default=None)
+    parser.add_argument("--eval_dataset_config", type=str, default=None)
+    parser.add_argument("--eval_split", type=str, default="validation")
+    parser.add_argument("--tokenizer_name", type=str, default="gpt2")
+    parser.add_argument(
+        "--no_streaming", action="store_true", help="Disable Hugging Face streaming"
     )
 
     # Model arguments
@@ -223,6 +308,40 @@ def main():
         help="Steps between slow loop runs (0 to disable)",
     )
     parser.add_argument(
+        "--slow_loop_assignment_method",
+        choices=("ot", "gmm"),
+        default="ot",
+        help="Expert role assignment method for the slow loop",
+    )
+    parser.add_argument(
+        "--slow_loop_smoothing",
+        action="store_true",
+        help="Apply spatial smoothing after hard role assignment",
+    )
+    parser.add_argument("--ot_epsilon", type=float, default=1.0)
+    parser.add_argument("--ot_tau_q", type=float, default=1.0)
+    parser.add_argument("--ot_tau_k", type=float, default=1.0)
+    parser.add_argument("--ot_n_iters", type=int, default=30)
+    parser.add_argument("--ot_refine_steps", type=int, default=2)
+    parser.add_argument("--ot_temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--ot_role_priors",
+        type=parse_role_priors,
+        default=(0.35, 0.45, 0.15, 0.05),
+        help="Comma-separated role priors, including dustbin when enabled",
+    )
+    parser.add_argument(
+        "--no_ot_dustbin",
+        action="store_true",
+        help="Disable the OT dustbin/overflow role",
+    )
+    parser.add_argument(
+        "--ot_router_adjustment_scale",
+        type=float,
+        default=0.1,
+        help="Router bias correction scale used after OT assignment",
+    )
+    parser.add_argument(
         "--checkpoint_dir",
         type=str,
         default="checkpoints",
@@ -248,6 +367,18 @@ def main():
         num_experts=args.num_experts,
         top_k_experts=2,
         expert_hidden_dim=args.d_model * 4,
+        slow_loop_assignment_method=args.slow_loop_assignment_method,
+        slow_loop_smoothing=args.slow_loop_smoothing,
+        ot_num_roles=3,
+        ot_use_dustbin=not args.no_ot_dustbin,
+        ot_epsilon=args.ot_epsilon,
+        ot_tau_q=args.ot_tau_q,
+        ot_tau_k=args.ot_tau_k,
+        ot_n_iters=args.ot_n_iters,
+        ot_refine_steps=args.ot_refine_steps,
+        ot_role_priors=args.ot_role_priors,
+        ot_temperature=args.ot_temperature,
+        ot_router_adjustment_scale=args.ot_router_adjustment_scale,
         use_sparse_attention=not args.no_nsa,
         window_size=args.window_size,
         compression_ratio=4,
@@ -292,18 +423,37 @@ def main():
             num_samples=args.batch_size * args.max_steps,
         )
     else:
-        try:
-            dataset = create_lm_dataset(
-                vocab_size=config.vocab_size, max_seq_len=args.max_seq_len
-            )
-        except Exception as e:
-            print(f"Failed to load dataset: {e}")
-            print("Falling back to dummy data...")
-            dataset = create_dummy_dataset(
+        dataset = create_lm_dataset(
+            dataset_name=args.dataset_name,
+            dataset_config=args.dataset_config,
+            split=args.train_split,
+            vocab_size=config.vocab_size,
+            max_seq_len=args.max_seq_len,
+            streaming=not args.no_streaming,
+            tokenizer_name=args.tokenizer_name,
+        )
+
+    eval_dataset = None
+    eval_iterator = None
+    if args.eval_interval > 0:
+        print("\nCreating evaluation dataset...")
+        if args.use_dummy_data:
+            eval_dataset = create_dummy_dataset(
                 vocab_size=config.vocab_size,
                 seq_len=args.max_seq_len,
-                num_samples=args.batch_size * args.max_steps,
+                num_samples=args.batch_size * args.eval_batches,
             )
+        else:
+            eval_dataset = create_lm_dataset(
+                dataset_name=args.eval_dataset_name or args.dataset_name,
+                dataset_config=args.eval_dataset_config or args.dataset_config,
+                split=args.eval_split,
+                vocab_size=config.vocab_size,
+                max_seq_len=args.max_seq_len,
+                streaming=not args.no_streaming,
+                tokenizer_name=args.tokenizer_name,
+            )
+        eval_iterator = iter(eval_dataset.batch(args.batch_size))
 
     # Training loop
     print("\nStarting training...")
@@ -311,6 +461,7 @@ def main():
     print(f"  Batch size: {args.batch_size}")
     print(f"  Max steps: {args.max_steps}")
     print(f"  Slow loop interval: {args.slow_loop_interval} steps")
+    print(f"  Assignment method: {args.slow_loop_assignment_method}")
 
     step = 0
     for epoch in range(args.num_epochs):
@@ -361,6 +512,50 @@ def main():
                         "Training/grad_norm", metrics["grad_norm"].item(), step
                     )
 
+            if eval_dataset is not None and step > 0 and step % args.eval_interval == 0:
+                eval_totals = {
+                    "total_loss": 0.0,
+                    "lm_loss": 0.0,
+                    "aux_loss": 0.0,
+                    "perplexity": 0.0,
+                }
+                for _ in range(args.eval_batches):
+                    try:
+                        eval_batch = next(eval_iterator)
+                    except StopIteration:
+                        eval_iterator = iter(eval_dataset.batch(args.batch_size))
+                        eval_batch = next(eval_iterator)
+
+                    if isinstance(eval_batch, dict):
+                        eval_input_ids = jnp.array(eval_batch["input_ids"])
+                    else:
+                        eval_input_ids = jnp.array(eval_batch)
+                    if eval_input_ids.shape[1] > args.max_seq_len:
+                        eval_input_ids = eval_input_ids[:, : args.max_seq_len]
+
+                    eval_metrics = eval_step(
+                        state,
+                        {"input_ids": eval_input_ids},
+                        args.aux_loss_weight,
+                    )
+                    for key_name in eval_totals:
+                        eval_totals[key_name] += float(
+                            jax.device_get(eval_metrics[key_name])
+                        )
+
+                eval_metrics_mean = {
+                    key_name: value / args.eval_batches
+                    for key_name, value in eval_totals.items()
+                }
+                print(
+                    "  Eval: "
+                    f"loss={eval_metrics_mean['total_loss']:.4f}, "
+                    f"ppl={eval_metrics_mean['perplexity']:.2f}"
+                )
+                if writer:
+                    for key_name, value in eval_metrics_mean.items():
+                        writer.add_scalar(f"Eval/{key_name}", value, step)
+
             # Run slow loop periodically
             if (
                 args.slow_loop_interval > 0
@@ -399,7 +594,13 @@ def main():
                 )
 
                 if "skipped" not in diagnostics:
-                    print("  Slow loop complete. Router adjustments applied.")
+                    log_slow_loop_diagnostics(writer, diagnostics, step)
+                    print(
+                        "  Slow loop complete. "
+                        f"method={diagnostics['assignment_method']}, "
+                        f"dustbin={float(jax.device_get(diagnostics['dustbin_mass'])):.4f}, "
+                        f"churn={float(jax.device_get(diagnostics['assignment_churn'])):.4f}"
+                    )
 
             step += 1
 

@@ -20,26 +20,24 @@ types while others remain generalists.
 import jax
 import jax.numpy as jnp
 from flax.core import unfreeze
-from typing import Dict, Tuple, Optional, Any
+from collections.abc import Mapping
+from typing import Dict, Tuple, Any
 
 # Handle imports
 try:
-    from src.forde.sensing import calculate_neuron_stats, hoyer_sparsity
     from src.forde.clustering import cluster_neurons_gmm
+    from src.forde.ot_assignment import assign_expert_roles_ot, ot_config_from_model_config
 except ModuleNotFoundError:
-    from sensing import calculate_neuron_stats, hoyer_sparsity
     from clustering import cluster_neurons_gmm
+    from ot_assignment import assign_expert_roles_ot, ot_config_from_model_config
 
 
-def calculate_expert_stats(
-    router_probs: jnp.ndarray, expert_outputs: Optional[jnp.ndarray] = None
-) -> jnp.ndarray:
+def calculate_expert_stats(router_probs: jnp.ndarray) -> jnp.ndarray:
     """
     Calculate statistics for each expert based on routing patterns.
 
     Args:
         router_probs: (batch, seq, num_experts) - Router probability distribution
-        expert_outputs: Optional (num_experts, batch, seq, d_model) - Expert outputs
 
     Returns:
         (num_experts, D) array of expert statistics
@@ -121,7 +119,7 @@ class MoESlowLoopState:
 
 def collect_moe_stats_from_variables(
     mutable_variables: Dict, num_layers: int, num_experts: int
-) -> Tuple[jnp.ndarray, int]:
+) -> Tuple[Dict[str, jnp.ndarray], int]:
     """
     Extract MoE statistics from model's mutable variables.
 
@@ -131,26 +129,64 @@ def collect_moe_stats_from_variables(
         num_experts: Number of experts per layer
 
     Returns:
-        Tuple of (expert_usage_stats, step_count)
-        - expert_usage_stats: (num_layers, num_experts)
+        Tuple of (expert_stats, step_count)
+        - expert_stats: Dict of arrays keyed by statistic name
         - step_count: Number of accumulated steps
     """
     stats_buffer = mutable_variables.get("stats_buffer", {})
 
     # Initialize output
     expert_usage = jnp.zeros((num_layers, num_experts))
+    expert_usage_sq = jnp.zeros((num_layers, num_experts))
+    expert_top1_confidence_sum = jnp.zeros((num_layers, num_experts))
+    expert_top1_count = jnp.zeros((num_layers, num_experts))
+    router_entropy = jnp.zeros((num_layers,))
+    token_count = jnp.zeros((num_layers,), dtype=jnp.int32)
     step_count = 0
 
     # Traverse stats_buffer to find expert_usage entries
     def find_expert_usage(pytree, layer_idx=0):
-        nonlocal expert_usage, step_count
+        nonlocal expert_usage
+        nonlocal expert_usage_sq
+        nonlocal expert_top1_confidence_sum
+        nonlocal expert_top1_count
+        nonlocal router_entropy
+        nonlocal token_count
+        nonlocal step_count
 
-        if isinstance(pytree, dict):
+        if isinstance(pytree, Mapping):
             if "expert_usage" in pytree:
                 # Found expert usage stats
                 usage = pytree["expert_usage"]
                 if usage.shape[0] == num_experts:
                     expert_usage = expert_usage.at[layer_idx].set(usage)
+
+            if "expert_usage_sq" in pytree:
+                usage_sq = pytree["expert_usage_sq"]
+                if usage_sq.shape[0] == num_experts:
+                    expert_usage_sq = expert_usage_sq.at[layer_idx].set(usage_sq)
+
+            if "expert_top1_confidence_sum" in pytree:
+                confidence_sum = pytree["expert_top1_confidence_sum"]
+                if confidence_sum.shape[0] == num_experts:
+                    expert_top1_confidence_sum = expert_top1_confidence_sum.at[
+                        layer_idx
+                    ].set(confidence_sum)
+
+            if "expert_top1_count" in pytree:
+                top1_count = pytree["expert_top1_count"]
+                if top1_count.shape[0] == num_experts:
+                    expert_top1_count = expert_top1_count.at[layer_idx].set(top1_count)
+
+            if "router_entropy" in pytree:
+                router_entropy = router_entropy.at[layer_idx].set(
+                    jnp.asarray(pytree["router_entropy"])
+                )
+
+            if "token_count" in pytree:
+                token_count = token_count.at[layer_idx].set(
+                    jnp.asarray(pytree["token_count"], dtype=jnp.int32)
+                )
 
             if "step_count" in pytree:
                 step_count = max(step_count, int(pytree["step_count"]))
@@ -169,7 +205,24 @@ def collect_moe_stats_from_variables(
 
     find_expert_usage(stats_buffer)
 
-    return expert_usage, step_count
+    safe_step_count = max(step_count, 1)
+    usage_mean = expert_usage / safe_step_count
+    usage_sq_mean = expert_usage_sq / safe_step_count
+    usage_var = jnp.maximum(usage_sq_mean - usage_mean**2, 0.0)
+    selection_confidence = expert_top1_confidence_sum / jnp.maximum(
+        expert_top1_count, 1.0
+    )
+    router_entropy_mean = router_entropy / safe_step_count
+
+    expert_stats = {
+        "usage_mean": usage_mean,
+        "usage_var": usage_var,
+        "selection_confidence": selection_confidence,
+        "router_entropy": router_entropy_mean,
+        "token_count": token_count,
+    }
+
+    return expert_stats, step_count
 
 
 def cluster_experts(
@@ -212,6 +265,7 @@ def compute_router_adjustments(
     expert_assignments: jnp.ndarray,
     expert_usage: jnp.ndarray,
     target_balance: float = 0.1,
+    dustbin_fraction: jnp.ndarray | None = None,
 ) -> jnp.ndarray:
     """
     Compute router bias adjustments based on expert clustering.
@@ -225,6 +279,7 @@ def compute_router_adjustments(
         expert_assignments: (num_experts,) cluster assignments
         expert_usage: (num_experts,) current usage frequencies
         target_balance: Target maximum deviation from uniform
+        dustbin_fraction: Optional per-expert dustbin mass fraction from OT
 
     Returns:
         (num_experts,) router bias adjustments
@@ -240,6 +295,17 @@ def compute_router_adjustments(
     # Limit adjustment magnitude
     max_adjustment = 0.1
     adjustments = -deviation * target_balance
+
+    # Experts assigned to the under-used role get a stronger positive recovery
+    # nudge when they are below uniform usage.
+    underused_mask = expert_assignments == 2
+    underused_boost = jnp.maximum(uniform - expert_usage, 0.0) * target_balance
+    adjustments = jnp.where(underused_mask, adjustments + underused_boost, adjustments)
+
+    if dustbin_fraction is not None:
+        confidence_scale = 1.0 - 0.5 * jnp.clip(dustbin_fraction, 0.0, 1.0)
+        adjustments = adjustments * confidence_scale
+
     adjustments = jnp.clip(adjustments, -max_adjustment, max_adjustment)
 
     # Don't adjust specialists as much (preserve their patterns)
@@ -286,7 +352,7 @@ def moe_slow_loop_step(
     num_experts = config.num_experts
 
     # 1. SENSE: Collect accumulated stats
-    expert_usage, step_count = collect_moe_stats_from_variables(
+    expert_stats, step_count = collect_moe_stats_from_variables(
         mutable_variables, num_layers, num_experts
     )
 
@@ -294,8 +360,9 @@ def moe_slow_loop_step(
         print("No stats accumulated yet, skipping slow loop.")
         return model_params, mutable_variables, {"skipped": True}
 
-    # Normalize by step count
-    expert_usage = expert_usage / step_count
+    expert_usage = expert_stats["usage_mean"]
+    expert_usage_var = expert_stats["usage_var"]
+    expert_selection_confidence = expert_stats["selection_confidence"]
 
     print("\n--- Sensing ---")
     print(f"Steps accumulated: {step_count}")
@@ -306,21 +373,38 @@ def moe_slow_loop_step(
         layer_usage = expert_usage[layer_idx]
         print(f"Layer {layer_idx} expert usage: {layer_usage}")
 
-    # 2. CLUSTER: Group experts by behavior
-    print("\n--- Clustering ---")
+    # 2. ASSIGN: Group experts by behavior
+    print("\n--- Assignment ---")
 
-    # Create feature vector for clustering
     # Use usage statistics across all layers
     usage_mean = expert_usage.mean(axis=0)  # (num_experts,)
-    usage_var = expert_usage.var(axis=0)  # (num_experts,)
+    usage_var = expert_usage_var.mean(axis=0)  # (num_experts,)
+    selection_confidence = expert_selection_confidence.mean(axis=0)
 
-    # Create simple feature matrix for clustering
-    cluster_features = jnp.stack([usage_mean, usage_var], axis=-1)
-
-    key, cluster_key = jax.random.split(key)
-    assignments, gmm_params = cluster_experts(
-        cluster_features, num_clusters=3, random_key=cluster_key
+    # Feature order is fixed by OT role prototypes: usage, variance, confidence.
+    assignment_features = jnp.stack(
+        [usage_mean, usage_var, selection_confidence], axis=-1
     )
+
+    assignment_method = getattr(config, "slow_loop_assignment_method", "ot")
+    ot_result = None
+    dustbin_fraction = None
+    if assignment_method == "ot":
+        ot_config = ot_config_from_model_config(config)
+        ot_result = assign_expert_roles_ot(assignment_features, usage_mean, ot_config)
+        assignments = ot_result.role_ids
+        dustbin_fraction = ot_result.dustbin_fraction
+        print("Assignment method: unbalanced OT")
+        print(f"Role masses: {ot_result.diagnostics['role_masses']}")
+        print(f"Dustbin mass: {ot_result.dustbin_mass:.4f}")
+    elif assignment_method == "gmm":
+        key, cluster_key = jax.random.split(key)
+        assignments, _gmm_params = cluster_experts(
+            assignment_features, num_clusters=3, random_key=cluster_key
+        )
+        print("Assignment method: GMM")
+    else:
+        raise ValueError(f"Unsupported slow_loop_assignment_method={assignment_method!r}.")
 
     # Count experts per cluster
     for c in range(3):
@@ -328,7 +412,7 @@ def moe_slow_loop_step(
         cluster_role = {0: "Generalist", 1: "Specialist", 2: "Under-utilized"}
         print(f"Cluster {c} ({cluster_role.get(c, 'Unknown')}): {count} experts")
 
-    # 3. SMOOTH: Apply 3D smoothing (optional)
+    # 3. SMOOTH: Apply 3D smoothing (optional ablation)
     # Reshape assignments to (1, 1, num_experts) for 1D smoothing, or (1, 2, 4) if 8 experts
     # For demonstration, we'll treat it as a 1D line of experts per layer
     # If we had multiple layers, we could smooth across layers too
@@ -343,27 +427,38 @@ def moe_slow_loop_step(
     # Here we just use 1 layer for simplicity of the demo
     assignment_grid = assignments.reshape(1, grid_h, grid_w)
 
-    try:
+    if getattr(config, "slow_loop_smoothing", False):
         try:
-            from src.forde.smoothing import smooth_assignments_3d
+            try:
+                from src.forde.smoothing import smooth_assignments_3d
+            except ImportError:
+                from smoothing import smooth_assignments_3d
+
+            print("\n--- Smoothing ---")
+            print(f"Reshaped assignments to grid: {assignment_grid.shape}")
+
+            smoothed_grid = smooth_assignments_3d(
+                assignment_grid, kernel_size=3, num_clusters=3
+            )
+            smoothed_assignments = smoothed_grid.flatten()
+
+            # Check changes
+            changes = (assignments != smoothed_assignments).sum()
+            print(f"Smoothing changed {changes} assignments")
+            assignments = smoothed_assignments
+
         except ImportError:
-            from smoothing import smooth_assignments_3d
+            print("\n--- Smoothing skipped (function not found) ---")
+    else:
+        print("\n--- Smoothing skipped (disabled) ---")
 
-        print("\n--- Smoothing ---")
-        print(f"Reshaped assignments to grid: {assignment_grid.shape}")
-
-        smoothed_grid = smooth_assignments_3d(
-            assignment_grid, kernel_size=3, num_clusters=3
-        )
-        smoothed_assignments = smoothed_grid.flatten()
-
-        # Check changes
-        changes = (assignments != smoothed_assignments).sum()
-        print(f"Smoothing changed {changes} assignments")
-        assignments = smoothed_assignments
-
-    except ImportError:
-        print("\n--- Smoothing skipped (function not found) ---")
+    previous_assignments = mutable_variables.get("stats_buffer", {}).get(
+        "last_assignments"
+    )
+    if previous_assignments is not None and previous_assignments.shape == assignments.shape:
+        assignment_churn = jnp.mean(previous_assignments != assignments)
+    else:
+        assignment_churn = jnp.array(0.0)
 
     # 4. ANALYZE: Compute specialization metrics
     print("\n--- Analysis ---")
@@ -384,59 +479,42 @@ def moe_slow_loop_step(
     print("\n--- Actuation ---")
 
     # Compute recommended adjustments
-    adjustments = compute_router_adjustments(assignments, usage_mean)
+    adjustment_scale = getattr(config, "ot_router_adjustment_scale", 0.1)
+    adjustments = compute_router_adjustments(
+        assignments,
+        usage_mean,
+        target_balance=adjustment_scale,
+        dustbin_fraction=dustbin_fraction,
+    )
     print(f"Recommended router adjustments: {adjustments}")
 
     # Apply adjustments to model parameters
     # We need to find the router bias parameters in the pytree
     # They are typically named 'router_linear' -> 'bias'
 
-    def update_router_bias(path, param):
+    updates_count = 0
+
+    def update_router_bias(path_items, param):
+        nonlocal updates_count
+        path = [
+            str(item.key) if hasattr(item, "key") else str(item)
+            for item in path_items
+        ]
+
         if "router_linear" in path and "bias" in path:
-            # Found a router bias!
-            # Check shape matches adjustments
             if param.shape == adjustments.shape:
-                print(f"Updating router bias at path: {path}")
+                updates_count += 1
                 return param + adjustments
         return param
 
-    # Traverse and update
-    # Helper to reconstruct path for logging
-    def map_with_path(fn, tree):
-        def _map(path, node):
-            if isinstance(node, dict) or hasattr(node, "keys"):
-                return {k: _map(path + (k,), v) for k, v in node.items()}
-            else:
-                return fn(path, node)
-
-        return _map((), tree)
-
-    # Since model_params is FrozenDict, we need to unfreeze/freeze or use tree_map
-    # But tree_map doesn't give paths. We can use flax.traverse_util
-    from flax import traverse_util
-
-    flat_params = traverse_util.flatten_dict(unfreeze(model_params))
-    updated_flat_params = {}
-
-    updates_count = 0
-    for path, param in flat_params.items():
-        # Check if this is a router bias
-        # Path is tuple like ('params', 'layers_0', 'moe', 'router_linear', 'bias')
-        if "router_linear" in path and "bias" in path:
-            if param.shape == adjustments.shape:
-                updated_flat_params[path] = param + adjustments
-                updates_count += 1
-            else:
-                updated_flat_params[path] = param
-        else:
-            updated_flat_params[path] = param
+    updated_params = jax.tree_util.tree_map_with_path(
+        update_router_bias, model_params
+    )
 
     if updates_count > 0:
         print(f"Applied updates to {updates_count} router biases")
-        updated_params = traverse_util.unflatten_dict(updated_flat_params)
     else:
         print("No matching router biases found to update")
-        updated_params = model_params
 
     # 6. RESET: Clear stats buffer
     def reset_leaf(x):
@@ -447,19 +525,50 @@ def moe_slow_loop_step(
         mutable_vars_unfrozen["stats_buffer"] = jax.tree.map(
             reset_leaf, mutable_vars_unfrozen["stats_buffer"]
         )
+        mutable_vars_unfrozen["stats_buffer"]["last_assignments"] = assignments
 
     print("\nStats buffer reset.")
     print(f"{'=' * 50}\n")
 
     # Collect diagnostics
     diagnostics = {
+        "assignment_method": assignment_method,
         "expert_usage": usage_mean,
+        "expert_usage_var": usage_var,
+        "selection_confidence": selection_confidence,
         "assignments": assignments,
         "load_imbalance": imbalance,
         "routing_entropy": relative_entropy,
+        "router_entropy": expert_stats["router_entropy"].mean(),
+        "assignment_churn": assignment_churn,
         "adjustments": adjustments,
+        "router_adjustment_norm": jnp.linalg.norm(adjustments),
         "step_count": step_count,
     }
+    if ot_result is not None:
+        diagnostics.update(
+            {
+                "role_probs": ot_result.role_probs,
+                "role_masses": ot_result.diagnostics["role_masses"],
+                "dustbin_mass": ot_result.dustbin_mass,
+                "mean_dustbin_fraction": ot_result.diagnostics[
+                    "mean_dustbin_fraction"
+                ],
+                "transport_entropy": ot_result.diagnostics["transport_entropy"],
+                "mean_role_confidence": ot_result.diagnostics["mean_role_confidence"],
+            }
+        )
+    else:
+        diagnostics.update(
+            {
+                "role_probs": jax.nn.one_hot(assignments, 3),
+                "role_masses": jnp.bincount(assignments, length=3) / num_experts,
+                "dustbin_mass": jnp.array(0.0),
+                "mean_dustbin_fraction": jnp.array(0.0),
+                "transport_entropy": jnp.array(0.0),
+                "mean_role_confidence": jnp.array(1.0),
+            }
+        )
 
     return updated_params, mutable_vars_unfrozen, diagnostics
 

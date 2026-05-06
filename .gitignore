@@ -15,3 +15,5 @@ wheels/
 # Generated files
 *.png
 outputs/
+runs/
+checkpoints/

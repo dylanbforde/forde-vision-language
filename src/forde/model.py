@@ -16,10 +16,11 @@ import jax.numpy as jnp
 from flax import linen as nn
 from typing import Optional, Tuple
 from dataclasses import dataclass
+import optax
 
 # Handle imports for both package and script execution
 try:
-    from src.forde.moe import MoELayer, MoEStatefulLayer
+    from src.forde.moe import MoEStatefulLayer
     from src.forde.sparse_attention import NativeSparseAttention, CausalSelfAttention
     from src.forde.hyper_connections import (
         HyperConnectionStream,
@@ -27,7 +28,7 @@ try:
         StreamCollapser,
     )
 except ModuleNotFoundError:
-    from moe import MoELayer, MoEStatefulLayer
+    from moe import MoEStatefulLayer
     from sparse_attention import NativeSparseAttention, CausalSelfAttention
     from hyper_connections import (
         HyperConnectionStream,
@@ -53,6 +54,20 @@ class LLMConfig:
     top_k_experts: int = 2
     expert_hidden_dim: int = 2048
     moe_aux_loss_weight: float = 0.01
+
+    # Slow-loop expert role assignment
+    slow_loop_assignment_method: str = "ot"
+    slow_loop_smoothing: bool = False
+    ot_num_roles: int = 3
+    ot_use_dustbin: bool = True
+    ot_epsilon: float = 1.0
+    ot_tau_q: float = 1.0
+    ot_tau_k: float = 1.0
+    ot_n_iters: int = 30
+    ot_refine_steps: int = 2
+    ot_role_priors: Tuple[float, ...] = (0.35, 0.45, 0.15, 0.05)
+    ot_temperature: float = 1.0
+    ot_router_adjustment_scale: float = 0.1
 
     # NSA configuration
     use_sparse_attention: bool = True
@@ -371,8 +386,6 @@ def create_default_config() -> LLMConfig:
 
 
 if __name__ == "__main__":
-    import optax  # Required for loss computation
-
     print("=" * 60)
     print("Testing FORDE Decoder-Only LLM")
     print("=" * 60)
@@ -447,7 +460,7 @@ if __name__ == "__main__":
         return lm_loss + aux_loss
 
     grads = jax.grad(loss_fn)(variables["params"], input_ids, labels)
-    grad_norm = jnp.sqrt(sum(jnp.sum(x**2) for x in jax.tree.leaves(grads)))
+    grad_norm = optax.global_norm(grads)
     print(f"Gradient norm: {grad_norm:.4f}")
 
     print("\n" + "=" * 60)

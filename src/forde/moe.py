@@ -144,8 +144,8 @@ class MoELayer(nn.Module):
         """
         Compute weighted combination of expert outputs for each token.
 
-        This is a simplified implementation that loops over experts.
-        For production, use optimized gather-scatter or capacity-based routing.
+        Iterates over experts and accumulates weighted outputs without creating
+        a large (num_experts, batch, seq, d_model) intermediate tensor.
 
         Args:
             x: (batch, seq, d_model)
@@ -156,33 +156,17 @@ class MoELayer(nn.Module):
         Returns:
             output: (batch, seq, d_model)
         """
-        batch_size, seq_len, d_model = x.shape
-
-        # Compute output from all experts (can be optimized with masking)
-        # Shape: (num_experts, batch, seq, d_model)
-        all_expert_outputs = jnp.stack([expert(x) for expert in experts], axis=0)
-
-        # Initialize output accumulator
         output = jnp.zeros_like(x)
 
-        # For each selected expert position in top_k
-        for k in range(self.top_k):
-            # Get expert indices for this k
-            expert_idx = top_k_indices[..., k]  # (batch, seq)
-            weights = top_k_probs[..., k : k + 1]  # (batch, seq, 1)
+        for expert_idx, expert in enumerate(experts):
+            expert_output = expert(x)
+            expert_weights = jnp.sum(
+                jnp.where(top_k_indices == expert_idx, top_k_probs, 0.0),
+                axis=-1,
+                keepdims=True,
+            )
 
-            # Gather expert outputs for selected experts
-            # Create advanced indexing
-            batch_indices = jnp.arange(batch_size)[:, None]
-            seq_indices = jnp.arange(seq_len)[None, :]
-
-            # Gather: all_expert_outputs[expert_idx[b,s], b, s, :]
-            selected_output = all_expert_outputs[
-                expert_idx, batch_indices, seq_indices, :
-            ]
-
-            # Weighted sum
-            output = output + weights * selected_output
+            output = output + expert_weights * expert_output
 
         return output
 
@@ -267,6 +251,29 @@ class MoEStatefulLayer(nn.Module):
             "expert_usage",
             lambda: jnp.zeros(self.num_experts, dtype=jnp.float32),
         )
+        expert_usage_sq_var = self.variable(
+            "stats_buffer",
+            "expert_usage_sq",
+            lambda: jnp.zeros(self.num_experts, dtype=jnp.float32),
+        )
+        expert_confidence_sum_var = self.variable(
+            "stats_buffer",
+            "expert_top1_confidence_sum",
+            lambda: jnp.zeros(self.num_experts, dtype=jnp.float32),
+        )
+        expert_selection_count_var = self.variable(
+            "stats_buffer",
+            "expert_top1_count",
+            lambda: jnp.zeros(self.num_experts, dtype=jnp.float32),
+        )
+        router_entropy_var = self.variable(
+            "stats_buffer",
+            "router_entropy",
+            lambda: jnp.array(0.0, dtype=jnp.float32),
+        )
+        token_count_var = self.variable(
+            "stats_buffer", "token_count", lambda: jnp.array(0, dtype=jnp.int32)
+        )
 
         # Track step count for averaging
         step_count_var = self.variable(
@@ -275,7 +282,20 @@ class MoEStatefulLayer(nn.Module):
 
         # Accumulate mean probability per expert
         current_usage = router_probs.mean(axis=(0, 1))  # (num_experts,)
+        current_usage_sq = (router_probs**2).mean(axis=(0, 1))
+        top1_mask = router_probs == router_probs.max(axis=-1, keepdims=True)
+        top1_confidence_sum = jnp.where(top1_mask, router_probs, 0.0).sum(axis=(0, 1))
+        top1_count = top1_mask.sum(axis=(0, 1)).astype(jnp.float32)
+        entropy = -(router_probs * jnp.log(router_probs + 1e-8)).sum(axis=-1).mean()
+
         expert_usage_var.value = expert_usage_var.value + current_usage
+        expert_usage_sq_var.value = expert_usage_sq_var.value + current_usage_sq
+        expert_confidence_sum_var.value = (
+            expert_confidence_sum_var.value + top1_confidence_sum
+        )
+        expert_selection_count_var.value = expert_selection_count_var.value + top1_count
+        router_entropy_var.value = router_entropy_var.value + entropy
+        token_count_var.value = token_count_var.value + batch_size * seq_len
         step_count_var.value = step_count_var.value + 1
 
         return output, aux_loss

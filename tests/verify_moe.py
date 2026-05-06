@@ -1,8 +1,6 @@
 
 import jax
 import jax.numpy as jnp
-import pytest
-from flax import linen as nn
 import sys
 import os
 
@@ -27,7 +25,7 @@ def test_moe_forward_pass():
         num_experts=num_experts,
         top_k=top_k,
         expert_hidden_dim=expert_hidden_dim,
-        d_model=d_model
+        d_model=d_model,
     )
 
     variables = moe.init(key, x)

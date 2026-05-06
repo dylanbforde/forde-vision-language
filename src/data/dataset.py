@@ -94,47 +94,61 @@ def create_dummy_dataset(
 
 
 def create_lm_dataset(
-    dataset_name: str = "HuggingFaceFW/fineweb",
+    dataset_name: str = "wikitext",
+    dataset_config: str | None = None,
     split: str = "train",
     vocab_size: int = 32000,
     max_seq_len: int = 512,
     streaming: bool = True,
+    tokenizer_name: str = "gpt2",
+    allow_dummy_fallback: bool = False,
 ):
     """
     Create a language modeling dataset from Hugging Face.
 
     Args:
         dataset_name: HuggingFace dataset name
+        dataset_config: Optional HuggingFace dataset configuration/subset
         split: Dataset split
         vocab_size: Vocabulary size (for tokenizer compatibility)
         max_seq_len: Maximum sequence length
         streaming: Whether to stream the dataset
+        tokenizer_name: HuggingFace tokenizer name
+        allow_dummy_fallback: Whether to fall back to random data on load failure
 
     Returns:
         Dataset that yields tokenized examples
     """
     if not HAS_DATASETS:
-        print("Warning: 'datasets' package not available. Using dummy data.")
-        return create_dummy_dataset(vocab_size, max_seq_len)
+        if allow_dummy_fallback:
+            print("Warning: 'datasets' package not available. Using dummy data.")
+            return create_dummy_dataset(vocab_size, max_seq_len)
+        raise ImportError(
+            "'datasets' package is required for real-data training. "
+            "Pass --use_dummy_data only for tests."
+        )
 
     try:
         from transformers import AutoTokenizer
 
-        # Load dataset
-        # For FineWeb, we usually want to use a specific subset or sample if not specified,
-        # but 'HuggingFaceFW/fineweb' requires a subset configuration usually.
-        # Fallback to 'sample-10BT' if it is the main repository.
-        subset = None
-        if dataset_name == "HuggingFaceFW/fineweb":
-            subset = "sample-10BT"
+        if dataset_config == "":
+            dataset_config = None
+        if dataset_config is None and dataset_name == "HuggingFaceFW/fineweb":
+            dataset_config = "sample-10BT"
+        if dataset_config is None and dataset_name == "wikitext":
+            dataset_config = "wikitext-103-raw-v1"
 
         dataset = datasets.load_dataset(
-            dataset_name, name=subset, streaming=streaming, split=split
+            dataset_name, name=dataset_config, streaming=streaming, split=split
         )
 
-        # Load tokenizer (using GPT-2 style tokenizer)
-        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         tokenizer.pad_token = tokenizer.eos_token
+        remove_columns = [
+            column
+            for column in (getattr(dataset, "column_names", None) or [])
+            if column != "input_ids"
+        ]
 
         # Streaming friendly tokenization
         if streaming:
@@ -154,17 +168,7 @@ def create_lm_dataset(
             tokenized_dataset = dataset.map(
                 streaming_tokenize,
                 batched=True,
-                remove_columns=[
-                    "text",
-                    "id",
-                    "dump",
-                    "url",
-                    "date",
-                    "file_path",
-                    "language",
-                    "language_score",
-                    "token_count",
-                ],
+                remove_columns=remove_columns,
             )
             # Since map on streaming returns an IterableDataset, we wrap it
             return StreamingLMDataset(tokenized_dataset)
@@ -186,15 +190,20 @@ def create_lm_dataset(
                 return {"input_ids": tokenized["input_ids"]}
 
             tokenized_dataset = dataset.map(
-                tokenize_function, batched=True, remove_columns=dataset.column_names
+                tokenize_function, batched=True, remove_columns=remove_columns
             )
 
-            return tokenized_dataset
+            return StreamingLMDataset(tokenized_dataset)
 
     except Exception as e:
-        print(f"Warning: Failed to load dataset '{dataset_name}': {e}")
-        print("Falling back to dummy data.")
-        return create_dummy_dataset(vocab_size, max_seq_len)
+        if allow_dummy_fallback:
+            print(f"Warning: Failed to load dataset '{dataset_name}': {e}")
+            print("Falling back to dummy data.")
+            return create_dummy_dataset(vocab_size, max_seq_len)
+        raise RuntimeError(
+            f"Failed to load real dataset {dataset_name!r} "
+            f"config={dataset_config!r} split={split!r}: {e}"
+        ) from e
 
 
 class StreamingLMDataset:

@@ -1,6 +1,8 @@
 import os
 import argparse
 import datasets
+import shutil
+import tempfile
 from transformers import AutoTokenizer
 from tqdm.auto import tqdm
 
@@ -9,7 +11,27 @@ import sys
 # Add project root to path to import from src
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
-from src.data.dataset import process_image, MAX_TEXT_LENGTH
+try:
+    from src.data.dataset import process_image, MAX_TEXT_LENGTH
+except ImportError:
+    MAX_TEXT_LENGTH = 64
+
+    def process_image(image_url):
+        """Download and normalize one RGB image for Conceptual Captions shards."""
+        import io
+
+        import numpy as np
+        import requests
+        from PIL import Image
+
+        try:
+            response = requests.get(image_url, timeout=10)
+            response.raise_for_status()
+            image = Image.open(io.BytesIO(response.content)).convert("RGB")
+            image = image.resize((224, 224))
+            return np.asarray(image, dtype=np.float32) / 255.0
+        except Exception:
+            return None
 
 
 def mount_drive():
@@ -69,6 +91,8 @@ def download_and_save(output_dir, num_proc=4, max_samples=None, shard_size=5000)
     """
     Downloads, processes, and saves the dataset in shards to allow resuming.
     """
+    temp_base = "/content" if os.path.exists("/content") else None
+
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
@@ -177,8 +201,6 @@ def download_and_save(output_dir, num_proc=4, max_samples=None, shard_size=5000)
         }
     )
 
-    import shutil
-
     print("Starting download and processing...")
 
     current_shard_data = []
@@ -198,28 +220,21 @@ def download_and_save(output_dir, num_proc=4, max_samples=None, shard_size=5000)
                     current_shard_data, features=features
                 )
 
-                # Save to a temporary local directory first to avoid Drive I/O latency
-                temp_shard_dir = f"/content/temp_shards/shard_{shard_counter}"
-                if os.path.exists(temp_shard_dir):
-                    shutil.rmtree(temp_shard_dir)
+                with tempfile.TemporaryDirectory(dir=temp_base) as temp_shard_dir:
+                    print(f"Saving shard {shard_counter} to temporary local storage")
+                    print(f"Temporary shard directory: {temp_shard_dir}")
+                    shard_dataset.save_to_disk(temp_shard_dir)
 
-                print(
-                    f"Saving shard {shard_counter} to temporary local storage ({temp_shard_dir})..."
-                )
-                shard_dataset.save_to_disk(temp_shard_dir)
+                    final_shard_dir = os.path.join(
+                        output_dir, f"shard_{shard_counter}"
+                    )
+                    print(
+                        f"Moving shard {shard_counter} to final destination: {final_shard_dir}..."
+                    )
 
-                # Move to final destination
-                final_shard_dir = os.path.join(output_dir, f"shard_{shard_counter}")
-                print(
-                    f"Moving shard {shard_counter} to final destination: {final_shard_dir}..."
-                )
-
-                if os.path.exists(final_shard_dir):
-                    shutil.rmtree(final_shard_dir)
-                shutil.copytree(temp_shard_dir, final_shard_dir)
-
-                # Cleanup temp
-                shutil.rmtree(temp_shard_dir)
+                    if os.path.exists(final_shard_dir):
+                        shutil.rmtree(final_shard_dir)
+                    shutil.copytree(temp_shard_dir, final_shard_dir)
 
                 print(f"Shard {shard_counter} successfully saved.")
                 shard_counter += 1
@@ -232,21 +247,19 @@ def download_and_save(output_dir, num_proc=4, max_samples=None, shard_size=5000)
                 current_shard_data, features=features
             )
 
-            temp_shard_dir = f"/content/temp_shards/shard_{shard_counter}"
-            if os.path.exists(temp_shard_dir):
-                shutil.rmtree(temp_shard_dir)
+            with tempfile.TemporaryDirectory(dir=temp_base) as temp_shard_dir:
+                print(
+                    f"Saving final shard {shard_counter} to temporary local storage..."
+                )
+                shard_dataset.save_to_disk(temp_shard_dir)
 
-            print(f"Saving final shard {shard_counter} to temporary local storage...")
-            shard_dataset.save_to_disk(temp_shard_dir)
+                final_shard_dir = os.path.join(output_dir, f"shard_{shard_counter}")
+                print(f"Moving final shard to {final_shard_dir}...")
 
-            final_shard_dir = os.path.join(output_dir, f"shard_{shard_counter}")
-            print(f"Moving final shard to {final_shard_dir}...")
+                if os.path.exists(final_shard_dir):
+                    shutil.rmtree(final_shard_dir)
+                shutil.copytree(temp_shard_dir, final_shard_dir)
 
-            if os.path.exists(final_shard_dir):
-                shutil.rmtree(final_shard_dir)
-            shutil.copytree(temp_shard_dir, final_shard_dir)
-
-            shutil.rmtree(temp_shard_dir)
             print("Done!")
 
     except KeyboardInterrupt:
@@ -257,16 +270,17 @@ def download_and_save(output_dir, num_proc=4, max_samples=None, shard_size=5000)
                 current_shard_data, features=features
             )
 
-            temp_shard_dir = f"/content/temp_shards/shard_{shard_counter}_partial"
-            print(f"Saving partial shard to {temp_shard_dir}...")
-            shard_dataset.save_to_disk(temp_shard_dir)
+            with tempfile.TemporaryDirectory(dir=temp_base) as temp_shard_dir:
+                print(f"Saving partial shard to {temp_shard_dir}...")
+                shard_dataset.save_to_disk(temp_shard_dir)
 
-            final_shard_dir = os.path.join(output_dir, f"shard_{shard_counter}_partial")
-            print(f"Moving partial shard to {final_shard_dir}...")
-            if os.path.exists(final_shard_dir):
-                shutil.rmtree(final_shard_dir)
-            shutil.copytree(temp_shard_dir, final_shard_dir)
-            shutil.rmtree(temp_shard_dir)
+                final_shard_dir = os.path.join(
+                    output_dir, f"shard_{shard_counter}_partial"
+                )
+                print(f"Moving partial shard to {final_shard_dir}...")
+                if os.path.exists(final_shard_dir):
+                    shutil.rmtree(final_shard_dir)
+                shutil.copytree(temp_shard_dir, final_shard_dir)
 
 
 if __name__ == "__main__":
