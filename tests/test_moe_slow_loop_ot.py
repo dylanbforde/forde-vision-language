@@ -52,9 +52,7 @@ def test_moe_slow_loop_uses_ot_and_preserves_last_assignments():
     config.ot_refine_steps = 1
 
     model_params = {
-        "layer_0": {
-            "moe": {"router_linear": {"bias": jnp.zeros(config.num_experts)}}
-        }
+        "layer_0": {"moe": {"router_linear": {"bias": jnp.zeros(config.num_experts)}}}
     }
     mutable_variables = {"stats_buffer": _stats_buffer(config.num_experts)}
 
@@ -76,4 +74,3 @@ def test_moe_slow_loop_uses_ot_and_preserves_last_assignments():
         config.num_experts,
     )
     assert updated_mutable["stats_buffer"]["layer_0"]["moe"]["step_count"] == 0
-

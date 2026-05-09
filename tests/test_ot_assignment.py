@@ -59,4 +59,3 @@ def test_ot_assignment_rejects_unsupported_role_count():
 
     with pytest.raises(ValueError):
         assign_expert_roles_ot(features, usage, config)
-

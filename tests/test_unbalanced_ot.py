@@ -74,4 +74,3 @@ def test_unbalanced_plan_respects_masked_support():
     assert plan.shape == score.shape
     assert plan[0, 1] == 0.0
     assert jnp.isfinite(plan).all()
-

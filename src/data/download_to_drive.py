@@ -225,9 +225,7 @@ def download_and_save(output_dir, num_proc=4, max_samples=None, shard_size=5000)
                     print(f"Temporary shard directory: {temp_shard_dir}")
                     shard_dataset.save_to_disk(temp_shard_dir)
 
-                    final_shard_dir = os.path.join(
-                        output_dir, f"shard_{shard_counter}"
-                    )
+                    final_shard_dir = os.path.join(output_dir, f"shard_{shard_counter}")
                     print(
                         f"Moving shard {shard_counter} to final destination: {final_shard_dir}..."
                     )

@@ -87,8 +87,7 @@ def test_moe_expert_accumulation_matches_stack_gather_reference():
         dtype=jnp.float32,
     )
     experts = [
-        lambda value, scale=scale: value * scale + scale
-        for scale in (1.0, 2.0, 3.0)
+        lambda value, scale=scale: value * scale + scale for scale in (1.0, 2.0, 3.0)
     ]
 
     actual = layer._compute_expert_outputs(x, experts, top_k_indices, top_k_probs)

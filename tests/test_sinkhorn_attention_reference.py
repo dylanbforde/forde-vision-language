@@ -32,4 +32,3 @@ def test_sinkhorn_attention_exact_and_tail_forward_match_on_tiny_case():
     assert tail.shape == queries.shape
     assert jnp.isfinite(exact).all()
     assert jnp.allclose(exact, tail, atol=1e-5)
-

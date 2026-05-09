@@ -17,4 +17,3 @@ def test_create_lm_dataset_allows_explicit_dummy_fallback(monkeypatch):
 
     batch = next(iter(dataset.batch(2)))
     assert batch["input_ids"].shape == (2, 512)
-

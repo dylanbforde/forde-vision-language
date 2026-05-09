@@ -26,7 +26,10 @@ from typing import Dict, Tuple, Any
 # Handle imports
 try:
     from src.forde.clustering import cluster_neurons_gmm
-    from src.forde.ot_assignment import assign_expert_roles_ot, ot_config_from_model_config
+    from src.forde.ot_assignment import (
+        assign_expert_roles_ot,
+        ot_config_from_model_config,
+    )
 except ModuleNotFoundError:
     from clustering import cluster_neurons_gmm
     from ot_assignment import assign_expert_roles_ot, ot_config_from_model_config
@@ -66,10 +69,15 @@ def calculate_expert_stats(router_probs: jnp.ndarray) -> jnp.ndarray:
 
     # 5. Sparsity of routing (per expert - how "confidently" is this expert selected)
     # When an expert is in top-k, what's the average weight?
-    max_probs_mask = router_probs == router_probs.max(axis=-1, keepdims=True)
-    expert_selection_confidence = jnp.where(max_probs_mask, router_probs, 0.0).sum(
-        axis=(0, 1)
-    ) / (max_probs_mask.sum(axis=(0, 1)) + eps)
+    # Bolt Optimization: Use argmax and bincount instead of bool masks and sum
+    top1_indices = jnp.argmax(router_probs, axis=-1).reshape(-1)
+    top1_max_probs = jnp.max(router_probs, axis=-1).reshape(-1)
+
+    top1_confidence_sum = jnp.bincount(
+        top1_indices, weights=top1_max_probs, length=num_experts
+    )
+    top1_count = jnp.bincount(top1_indices, length=num_experts).astype(jnp.float32)
+    expert_selection_confidence = top1_confidence_sum / jnp.maximum(top1_count, 1.0)
 
     # Stack into feature vector
     stats = jnp.stack(
@@ -404,7 +412,9 @@ def moe_slow_loop_step(
         )
         print("Assignment method: GMM")
     else:
-        raise ValueError(f"Unsupported slow_loop_assignment_method={assignment_method!r}.")
+        raise ValueError(
+            f"Unsupported slow_loop_assignment_method={assignment_method!r}."
+        )
 
     # Count experts per cluster
     for c in range(3):
@@ -455,7 +465,10 @@ def moe_slow_loop_step(
     previous_assignments = mutable_variables.get("stats_buffer", {}).get(
         "last_assignments"
     )
-    if previous_assignments is not None and previous_assignments.shape == assignments.shape:
+    if (
+        previous_assignments is not None
+        and previous_assignments.shape == assignments.shape
+    ):
         assignment_churn = jnp.mean(previous_assignments != assignments)
     else:
         assignment_churn = jnp.array(0.0)
@@ -497,8 +510,7 @@ def moe_slow_loop_step(
     def update_router_bias(path_items, param):
         nonlocal updates_count
         path = [
-            str(item.key) if hasattr(item, "key") else str(item)
-            for item in path_items
+            str(item.key) if hasattr(item, "key") else str(item) for item in path_items
         ]
 
         if "router_linear" in path and "bias" in path:
@@ -507,9 +519,7 @@ def moe_slow_loop_step(
                 return param + adjustments
         return param
 
-    updated_params = jax.tree_util.tree_map_with_path(
-        update_router_bias, model_params
-    )
+    updated_params = jax.tree_util.tree_map_with_path(update_router_bias, model_params)
 
     if updates_count > 0:
         print(f"Applied updates to {updates_count} router biases")
@@ -551,9 +561,7 @@ def moe_slow_loop_step(
                 "role_probs": ot_result.role_probs,
                 "role_masses": ot_result.diagnostics["role_masses"],
                 "dustbin_mass": ot_result.dustbin_mass,
-                "mean_dustbin_fraction": ot_result.diagnostics[
-                    "mean_dustbin_fraction"
-                ],
+                "mean_dustbin_fraction": ot_result.diagnostics["mean_dustbin_fraction"],
                 "transport_entropy": ot_result.diagnostics["transport_entropy"],
                 "mean_role_confidence": ot_result.diagnostics["mean_role_confidence"],
             }

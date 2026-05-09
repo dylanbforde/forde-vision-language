@@ -73,6 +73,7 @@ def calculate_neuron_stats(activations, gradients):
 
     return neuron_stats
 
+
 if __name__ == "__main__":
     # Example usage
     batch_size = 8

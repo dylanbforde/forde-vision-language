@@ -1,4 +1,3 @@
-
 import jax
 
 # Try importing from src
@@ -7,9 +6,11 @@ try:
     from src.forde.moe import MoELayer
 except ImportError:
     import sys
+
     sys.path.append(".")
     from src.forde.sparse_attention import TopKSelection, NativeSparseAttention
     from src.forde.moe import MoELayer
+
 
 def test_topk_usage():
     key = jax.random.PRNGKey(0)
@@ -32,9 +33,13 @@ def test_topk_usage():
     # 2. Test NativeSparseAttention
     print("Testing NativeSparseAttention...")
     layer = NativeSparseAttention(
-        num_heads=2, head_dim=32,
-        window_size=32, compression_ratio=4, top_k_global=k,
-        use_compressed=False, use_top_k=True
+        num_heads=2,
+        head_dim=32,
+        window_size=32,
+        compression_ratio=4,
+        top_k_global=k,
+        use_compressed=False,
+        use_top_k=True,
     )
     variables = layer.init(key, x)
     output = layer.apply(variables, x)
@@ -47,8 +52,10 @@ def test_topk_usage():
     num_experts = 8
     top_k_experts = 2
     layer = MoELayer(
-        num_experts=num_experts, top_k=top_k_experts,
-        expert_hidden_dim=128, d_model=d_model
+        num_experts=num_experts,
+        top_k=top_k_experts,
+        expert_hidden_dim=128,
+        d_model=d_model,
     )
     variables = layer.init(key, x)
     output, aux_loss, router_probs = layer.apply(variables, x)
@@ -58,6 +65,7 @@ def test_topk_usage():
     # Verify aux_loss is scalar
     assert aux_loss.shape == ()
     print("MoELayer passed.")
+
 
 if __name__ == "__main__":
     test_topk_usage()
