@@ -225,7 +225,9 @@ def log_slow_loop_diagnostics(writer, diagnostics, step: int):
     ]
     for key in scalar_keys:
         if key in diagnostics:
-            writer.add_scalar(f"SlowLoop/{key}", float(jax.device_get(diagnostics[key])), step)
+            writer.add_scalar(
+                f"SlowLoop/{key}", float(jax.device_get(diagnostics[key])), step
+            )
 
     if "role_masses" in diagnostics:
         for role_idx, mass in enumerate(jax.device_get(diagnostics["role_masses"])):

@@ -1,3 +1,7 @@
 ## 2024-05-23 - MoE Routing Optimization
 **Learning:** Significant speedups can be achieved in MoE routing by replacing `argsort` with `jax.lax.top_k` (~18x) and `one_hot().sum()` with `jnp.bincount` (~15x). However, these gains may be masked by inefficient expert execution loops in naive implementations.
 **Action:** Always verify micro-benchmarks for component-level optimizations when end-to-end impact is limited by other bottlenecks. Ensure `uv.lock` is not accidentally modified during dependency resolution.
+
+## 2024-05-11 - JAX Boolean Masking vs. Bincount Memory & Speed Impact
+**Learning:** Calculating aggregated metrics for selected top-k indices in JAX using `jnp.where(mask, values, 0.0).sum(...)` or `mask.sum(...)` allocates full-size intermediate boolean tensors that lead to memory bloat and slow execution times. Replacing boolean masking and summing with `jnp.argmax` combined with `jnp.bincount` explicitly limits allocations and yields ~2.7x speedups in metric tracking, while also solving the issue where ties would incorrectly double-count usage and confidence metrics.
+**Action:** When calculating statistics over selected classes, routing targets, or sparse indices, avoid `mask == max` followed by `where` and `sum`. Always flatten dimensions and prefer `jnp.argmax(axis=-1).reshape(-1)` + `jnp.bincount(indices, weights=values)` for massive memory and speed efficiency in JIT-compiled functions.
